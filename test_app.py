@@ -201,10 +201,13 @@ def test_not_enough_bits(db):
     main.start_spin(db, user, 1)                      # 300 is fine
 
 
-def test_unapproved_cannot_spin(db):
+def test_no_approval_needed_but_the_wallet_is_the_gate(db):
     user = mkuser(db, "waiting", bits=10_000, approved=False)
-    with pytest.raises(main.Refused):
-        main.start_spin(db, user, 1)
+    main.start_spin(db, user, 1)                      # never approved, still spins
+    poor = mkuser(db, "broke", bits=0, approved=True)
+    with pytest.raises(main.Refused) as err:
+        main.start_spin(db, poor, 1)
+    assert "no BITS yet" in str(err.value) and main.BITS_HELP in str(err.value)
 
 
 def test_bad_wager(db):
@@ -406,13 +409,23 @@ def test_capped_flag_reaches_the_api(db, client):
     assert data["wager"] == 1 and data["capped"] is True and data["cost"] == 300
 
 
-def test_waiting_user_sees_notice(db, client):
-    user = mkuser(db, "waiting", bits=1_000, approved=False)
+def test_new_account_sees_the_wheel_and_the_help_link(db, client):
+    user = mkuser(db, "waiting", bits=0, approved=False)
     login(client, user.id)
-    assert "Waiting for the admin" in client.get("/").text
+    page = client.get("/").text
+    assert "id=wheel" in page and "Waiting for the admin" not in page
+    assert "You have no BITS yet" in page and main.BITS_HELP in page
 
 
-def test_local_register_then_login(db, client):
+def test_local_login_is_off_by_default(client):
+    assert main.ALLOW_LOCAL is False
+    r = client.post("/auth/local", data={"username": "newbie", "password": "longenough",
+                                         "mode": "register"})
+    assert r.status_code == 403
+
+
+def test_local_register_then_login(db, client, monkeypatch):
+    monkeypatch.setattr(main, "ALLOW_LOCAL", True)
     r = client.post("/auth/local", data={"username": "newbie", "password": "longenough",
                                          "mode": "register"}, follow_redirects=False)
     assert r.status_code in (303, 307)
@@ -448,28 +461,25 @@ def test_password_account_named_cc_is_not_admin(db):
     assert main.is_admin(fake) is False
 
 
-def test_local_register_of_the_admin_name_is_refused(client):
+def test_local_register_of_the_admin_name_is_refused(client, monkeypatch):
+    monkeypatch.setattr(main, "ALLOW_LOCAL", True)
     r = client.post("/auth/local", data={"username": "CC_Prestiged", "password": "longenough",
                                          "mode": "register"})
     assert r.status_code == 403
+    assert "signed in with Lichess" in r.text
 
 
-def test_local_login_can_be_turned_off(client, monkeypatch):
-    monkeypatch.setattr(main, "ALLOW_LOCAL", False)
-    r = client.post("/auth/local", data={"username": "someone", "password": "longenough",
-                                         "mode": "register"})
-    assert r.status_code == 403
+def test_login_page_hides_the_password_form_when_off(client):
+    assert main.ALLOW_LOCAL is False
     assert "Or a local account" not in client.get("/").text
+    assert "Continue with Lichess" in client.get("/").text
 
 
-def test_admin_can_approve_a_pending_account(db, client):
+def test_approval_route_is_gone(db, client):
     admin = mkuser(db, CC, bits=10**9)
-    pending = mkuser(db, "latecomer", bits=0, approved=False)
+    other = mkuser(db, "latecomer", bits=0)
     login(client, admin.id)
-    r = client.post("/admin/approve/%d" % pending.id, follow_redirects=False)
-    assert r.status_code == 303
-    db.expire_all()
-    assert db.get(main.User, pending.id).approved is True
+    assert client.post("/admin/approve/%d" % other.id, follow_redirects=False).status_code == 404
 
 
 def test_sacrifice_rebuilt_when_column_p_has_no_cached_value():
@@ -614,10 +624,11 @@ def test_a_pending_admin_still_gets_the_wheel(db, client):
     assert "id=wheel" in page
 
 
-def test_a_normal_player_is_still_held_back(db, client):
-    user = mkuser(db, "newbie", bits=1, approved=False)
+def test_a_player_with_bits_sees_no_warning(db, client):
+    user = mkuser(db, "rich", bits=5_000, approved=False)
     login(client, user.id)
-    assert "Waiting for the admin" in client.get("/").text
+    page = client.get("/").text
+    assert "You have no BITS yet" not in page and "id=wheel" in page
 
 
 def test_admin_403_says_who_you_are(db, client):
@@ -631,3 +642,43 @@ def test_admin_403_says_who_you_are(db, client):
 def test_admin_403_asks_for_a_login_when_anonymous(client):
     r = client.get("/admin")
     assert r.status_code == 403 and "Log in with it" in r.text
+
+
+# --------------------------------------------------------------------- the one worklist
+def test_deltas_csv_carries_the_prizes(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    player = mkuser(db, "winner", bits=10**8)
+    for index, wager in ((13, 2), (13, 1), (12, 4)):
+        spin, _c, _ = main.start_spin(db, player, wager)
+        force_index(db, spin, index)
+        main.settle_spin(db, player, spin.id)
+    login(client, admin.id)
+    text = client.get("/admin/deltas.csv").text
+    head, row = text.splitlines()[0], text.splitlines()[1]
+    assert head == ("username,rank,spending_before,delta_to_type_into_H,spending_after,"
+                    "spins,staked,prizes_owed")
+    assert row.startswith("@winner,")
+    assert "Moving Logo x3" in row and "Static Logo x4" in row
+    assert row.count(";") == 1
+
+
+def test_prize_csv_and_admin_table_keep_emoji_out_of_the_csv(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    player = mkuser(db, "winner", bits=10**8)
+    spin, _c, _ = main.start_spin(db, player, 2)
+    force_index(db, spin, 13)
+    main.settle_spin(db, player, spin.id)
+    login(client, admin.id)
+    csv_text = client.get("/admin/prizes.csv").text
+    assert "Moving Logo,2" in csv_text and "\U0001F39E" not in csv_text
+    page = client.get("/admin").text
+    assert "\U0001F39E" in page and "Moving Logo" in page
+
+
+def test_admin_sees_who_is_not_in_the_bank(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    mkuser(db, "outsider", bits=0)
+    main.sync_bank(db, blob=workbook([(2, "alpha", 1_000_000, 0, "Sovereign", 0)]), origin="t")
+    login(client, admin.id)
+    page = client.get("/admin").text
+    assert "not in bank" in page and "in bank" in page
