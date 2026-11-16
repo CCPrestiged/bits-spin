@@ -73,7 +73,12 @@ def name_key(value) -> str:
 ADMIN_LICHESS = name_key(ADMIN_RAW)
 ADMIN_KEY = env("BS_ADMIN_KEY", "")          # optional break-glass, off unless set
 
-ALLOW_LOCAL = env("BS_ALLOW_LOCAL", "1") == "1"
+# Password logins are off unless you ask for them: anyone could register the name of a
+# player who already has BITS. Lichess OAuth is the way in. BS_ALLOW_LOCAL=1 turns the
+# password form back on, which is useful for testing on your own machine.
+ALLOW_LOCAL = env("BS_ALLOW_LOCAL", "0") == "1"
+BITS_HELP = env("BS_BITS_HELP",
+                "https://sites.google.com/view/real-humans-codex/knowledge/bits-info-simple")
 # Lichess has retired app registration (/account/oauth/app is gone) and expects public
 # clients only. Their own error message for a missing client_id is "client_id required
 # (choose any)", so this string is simply an identifier, not a registered application,
@@ -179,7 +184,7 @@ class User(Base):
     lichess_id = Column(String(64), unique=True, index=True)
     display = Column(String(64))
     password_hash = Column(String(255))
-    approved = Column(Boolean, default=False)
+    approved = Column(Boolean, default=False)   # vestigial: nobody is gated on this now
     is_admin = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), default=utcnow)
     bank_bits = Column(BigInteger, default=0)        # J - P*1e6 at the last sync
@@ -307,9 +312,6 @@ def sweep(db, now=None) -> int:
 
 def start_spin(db, user, wager):
     sweep(db)
-    if not user.approved:
-        raise Refused("Your account is waiting for the admin to confirm your Lichess name.")
-
     capped = False
     multiple = can_wager_multiple(user.bank_rank)
     try:
@@ -324,6 +326,9 @@ def start_spin(db, user, wager):
     cost = SPIN_COST * wager
     balance = available_bits(db, user)
     if cost > balance:
+        if balance <= 0:
+            raise Refused("You have no BITS yet, so there is nothing to spin with. "
+                          "How BITS work: " + BITS_HELP)
         raise Refused("That costs %s BITS; you have %s." % (f"{cost:,}", f"{balance:,}"))
 
     seed = secrets.token_hex(32)
@@ -622,6 +627,8 @@ th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
 th{color:var(--muted);font-weight:600;font-size:.74rem;text-transform:uppercase;letter-spacing:.1em}
 .mono{font-variant-numeric:tabular-nums}
 .hint{color:var(--muted);font-size:.86rem}
+.note{border:1px solid rgba(242,193,78,.38);background:rgba(242,193,78,.07);
+border-radius:14px;padding:14px 18px;margin:0 0 18px;font-size:.92rem;line-height:1.5}
 .err{color:#fca5a5;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.35);
 padding:10px 14px;border-radius:12px;margin:12px 0}
 .result{min-height:56px;display:flex;align-items:center;justify-content:center;
@@ -762,6 +769,15 @@ function busy(on) {
   drawWheel();
 }
 
+function emojiFor(label) {
+  const s = SLICES.filter(x => x.label === label)[0];
+  return s ? s.emoji : '';
+}
+
+const VMAX = 0.0082;        /* radians per millisecond once it is up to speed */
+const RAMP = 520;           /* ms to get there */
+const CRUISE_MIN = 3300;    /* never finish before this: a wheel should look like a wheel */
+
 async function spin() {
   if (spinning) return;
   show('');
@@ -779,37 +795,54 @@ async function spin() {
   document.getElementById('balance').textContent = j.balance.toLocaleString();
   busy(true);
 
-  const t0 = performance.now(), ramp = 900, cruise = 8600;
   let settle = null;
   fetch('/api/spin/' + spinId + '/settle', {method: 'POST'})
     .then(r => r.json().then(d => { settle = {ok: r.ok, d: d}; }));
 
+  /* Phase one: spin up, then hold speed. Everything is driven by elapsed time, so the
+     wheel turns at the same rate on a 144 Hz screen as on a 60 Hz one. */
+  let last = performance.now(), t0 = last, speed = 0;
   await new Promise(done => (function frame(now) {
+    const dt = Math.min(50, now - last); last = now;
     const t = now - t0;
-    angle += (t < ramp ? 0.010 + 0.075 * (t / ramp) : 0.085);
+    speed = t < RAMP ? VMAX * (t / RAMP) * (t / RAMP) : VMAX;
+    angle += speed * dt;
     drawWheel();
-    if (t < cruise) requestAnimationFrame(frame); else done();
-  })(t0));
+    if ((t >= CRUISE_MIN && settle) || t > 15000) return done();
+    requestAnimationFrame(frame);
+  })(last));
 
-  while (!settle) await new Promise(r => setTimeout(r, 60));
-  if (!settle.ok) { busy(false); show(settle.d.detail || 'The spin was lost.', true); return; }
-
+  if (!settle) {
+    busy(false);
+    show('The server stopped answering. Look at Your spins before trying again.', true);
+    loadLog();
+    return;
+  }
+  if (!settle.ok) { busy(false); show(settle.d.detail || 'The spin was lost.', true); loadLog(); return; }
   const d = settle.d;
-  const target = -(d.index + 0.5) * STEP;      /* the winning slice must sit under the pointer */
-  let to = target, from = angle;
-  while (to < from + 4 * Math.PI) to += 2 * Math.PI;
-  const t1 = performance.now(), dur = 1900;
+
+  /* Phase two: slow down onto the slice. A quadratic ease-out leaves at exactly the speed
+     the wheel already has and arrives at zero, so the hand-over has no jolt in it. */
+  const TAU = 2 * Math.PI;
+  const wrap = a => a - TAU * Math.floor(a / TAU);   /* fold back into 0 .. TAU */
+  const target = -(d.index + 0.5) * STEP;
+  const from = angle;
+  const delta = wrap(target - from) + TAU;           /* always at least one more turn */
+  const T = 2 * delta / Math.max(speed, VMAX * 0.6);            /* ms: by construction */
+  const startedAt = performance.now();
   await new Promise(done => (function ease(now) {
-    const p = Math.min(1, (now - t1) / dur), e = 1 - Math.pow(1 - p, 3);
-    angle = from + (to - from) * e;
+    const p = Math.min(1, (now - startedAt) / T);
+    angle = from + delta * (1 - Math.pow(1 - p, 2));
     drawWheel();
     p < 1 ? requestAnimationFrame(ease) : done();
-  })(t1));
-  angle = to;
+  })(startedAt));
+  angle = wrap(from + delta);
+  drawWheel();
 
+  const em = emojiFor(d.label);
   document.getElementById('result').textContent = d.kind === 'prize'
-    ? d.label + ' \u00d7 ' + d.prize_qty.toLocaleString()
-    : d.label + '  \u2192  +' + d.payout.toLocaleString() + ' BITS';
+    ? em + ' ' + d.label + ' \u00d7 ' + d.prize_qty.toLocaleString()
+    : em + ' ' + d.label + '  \u2192  +' + d.payout.toLocaleString() + ' BITS';
   document.getElementById('balance').textContent = d.balance.toLocaleString();
   document.getElementById('commit').textContent =
     'wager x' + d.wager + ' \u00b7 seed ' + d.seed.slice(0, 12) + '\u2026 \u00b7 sha256 ' +
@@ -829,10 +862,12 @@ function pickWager(btn) {
 async function loadLog() {
   const rows = await (await fetch('/api/spins')).json();
   document.querySelector('#log tbody').innerHTML = rows.map(s => {
-    const what = s.status === 'settled'
-      ? (s.kind === 'prize' ? s.label + ' \u00d7 ' + s.prize_qty.toLocaleString()
-                            : s.label + '  +' + s.payout.toLocaleString())
-      : s.status;
+    let what = s.status;
+    if (s.status === 'settled') {
+      what = emojiFor(s.label) + ' ' + s.label +
+        (s.kind === 'prize' ? ' \u00d7 ' + s.prize_qty.toLocaleString()
+                            : '  +' + s.payout.toLocaleString());
+    }
     return '<tr><td class="mono">' + new Date(s.created_at).toLocaleString() + '</td>' +
       '<td class="mono">x' + s.wager + '</td><td>' + what + '</td>' +
       '<td class="mono">-' + s.cost.toLocaleString() + '</td></tr>';
@@ -913,19 +948,30 @@ def index_page(user, state, slices_json):
                                                   "" if multi else " disabled", f"{w:,}")
         for w in (1, 2, 5, 10, 25, 50, 100, 250, 500, 1000))
     rank_pill = ('<span class="pill ok">%s · multiples unlocked</span>' % esc(user.bank_rank)
-                 if multi else '<span class="pill no">%s · 300 BITS per spin, no multiples</span>'
-                 % esc(user.bank_rank or "no rank"))
+                 if multi else '<span class="pill no">%s · %d BITS per spin, no multiples</span>'
+                 % (esc(user.bank_rank or "no rank"), SPIN_COST))
+    admin_link = ('<a class=btn href="/admin" style="text-decoration:none;margin-right:8px">Admin'
+                  '</a>' if is_admin(user) else "")
+    zero = ""
+    if state["available"] <= 0:
+        zero = ('<div class=note><b>You have no BITS yet.</b> Everything is visible, but a spin '
+                'costs %d BITS, so the button will refuse until the bank has a figure for you. '
+                '<a href="%s" target=_blank rel=noopener>How BITS work →</a> If your Lichess name '
+                'is not in the BITS Bank yet, say so in the team chat and it gets added.'
+                % (SPIN_COST, esc(BITS_HELP)))
     js = WHEEL_JS % {"slices": slices_json, "ttl": SPIN_TTL, "cost": SPIN_COST,
                      "multi": "true" if multi else "false"}
     return page("""
 <header class=top><div class=brand>Real Humans · <b>Mystery BITS</b></div>
 <div class=spacer></div><span class=pill>@%s</span>%s
 %s<a class=btn href="/logout" style="text-decoration:none">Log out</a></header>
+%s
 <div class=row>
   <div class=card>
     <div class=lab>Spending BITS · tentative until the bank is updated</div>
     <div class=balance id=balance>%s</div>
-    <div class=hint>Bank figure %s %s everything you have done here since the admin last updated.</div>
+    <div class=hint>Bank figure %s %s everything you have done here since the admin last updated.
+      <a href="%s" target=_blank rel=noopener>How BITS work</a></div>
     <hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
     <div class=lab>Wager</div>
     <div class=wager>%s</div>
@@ -948,13 +994,13 @@ def index_page(user, state, slices_json):
 <div class=card style="margin-top:20px"><div class=lab>Your spins</div>
   <table id=log><thead><tr><th>When</th><th>Wager</th><th>Landed</th><th>Cost</th></tr></thead>
   <tbody></tbody></table></div>
-<footer>Real Humans · Mystery BITS · emoji artwork from Twemoji (CC-BY 4.0)</footer>
+<footer>Real Humans · Mystery BITS · emoji artwork from Twemoji (CC-BY 4.0) ·
+  <a href="%s" target=_blank rel=noopener>BITS guide</a></footer>
 <script>%s</script>
-""" % (esc(user.display or user.lichess_id), rank_pill,
-       '<a class=btn href="/admin" style="text-decoration:none;margin-right:8px">Admin</a>'
-       if user.is_admin else "",
+""" % (esc(user.display or user.lichess_id), rank_pill, admin_link, zero,
        f"{state['available']:,}", "plus" if state["delta"] >= 0 else "minus",
-       f"{abs(state['delta']):,}", wager_buttons, "" if multi else " disabled", js))
+       f"{abs(state['delta']):,}", esc(BITS_HELP), wager_buttons,
+       "" if multi else " disabled", esc(BITS_HELP), js))
 
 
 def admin_page(rows, prizes, meta):
@@ -963,28 +1009,30 @@ def admin_page(rows, prizes, meta):
         "<td class=mono>%s</td><td class=mono>%s</td><td class=mono>%s</td><td>%s</td></tr>"
         % (esc(r["display"]), esc(r["rank"] or "-"), f"{r['bank']:,}", f"{r['delta']:+,}",
            f"{r['available']:,}", r["spins"], f"{r['staked']:,}",
-           '<span class="pill ok">ok</span>' if r["approved"] else
-           ('<form method=post action="/admin/approve/%d" style="display:inline">'
-            '<button style="padding:2px 8px;font-size:.78rem">approve</button></form>' % r["id"]))
+           '<span class="pill ok">in bank</span>' if r["in_bank"] else
+           '<span class="pill no">not in bank</span>')
         for r in rows)
-    prize_rows = "".join("<tr><td>@%s</td><td>%s</td><td class=mono>%s</td></tr>"
-                         % (esc(p["display"]), esc(p["label"]), f"{p['qty']:,}") for p in prizes)
+    prize_rows = "".join("<tr><td>@%s</td><td>%s %s</td><td class=mono>%s</td></tr>"
+                         % (esc(p["display"]), emoji_of(p["label"]), esc(p["label"]),
+                            f"{p['qty']:,}")
+                         for p in prizes)
     return page("""
 <header class=top><div class=brand>Real Humans · <b>admin</b></div>
 <div class=spacer></div><span class=pill>%s players in the bank</span>
 <span class=pill>read %s</span><a class=btn href="/" style="text-decoration:none">Site</a></header>
 <div class=card style="margin-bottom:18px">
   <div class=lab>Since your last update</div>
-  <p class=hint>Type each delta into column H of the sheet (that moves J, and J − P×1e6 is the
-  spending figure). Then <b>Sync bank</b>, then <b>Mark applied</b>. Nothing is written for you.
-  Anyone listed as pending is not in the sheet, so they have no BITS to spin with.</p>
+  <p class=hint>Everything you have to do is in one file: <b>Deltas + prizes</b>. Type each delta
+  into column H of the sheet (that moves J, and J − P×1e6 is the spending figure), hand out the
+  prizes in the last column, then <b>Sync bank</b> and <b>Mark applied</b>. Nothing is written
+  for you. Someone marked <i>not in bank</i> has no BITS, so they cannot spin yet.</p>
   <form method=post action="/admin/sync" style="display:inline"><button class=primary>Sync bank</button></form>
   <form method=post action="/admin/apply" style="display:inline"
     onsubmit="return confirm('Have you already typed these deltas into the sheet?')">
     <button>Mark applied</button></form>
-  <a class=btn href="/admin/deltas.csv" style="text-decoration:none;display:inline-block">Deltas CSV</a>
+  <a class=btn href="/admin/deltas.csv" style="text-decoration:none;display:inline-block">Deltas + prizes</a>
   <a class=btn href="/admin/spins.csv" style="text-decoration:none;display:inline-block">Every spin</a>
-  <a class=btn href="/admin/prizes.csv" style="text-decoration:none;display:inline-block">Prizes owed</a>
+  <a class=btn href="/admin/prizes.csv" style="text-decoration:none;display:inline-block">Prizes only</a>
   <form method=post action="/admin/upload" enctype=multipart/form-data style="margin-top:14px">
     <div class=lab>Or upload the workbook</div>
     <input type=file name=file accept=.xlsx style="margin:8px 0"><button>Upload and sync</button></form>
@@ -1069,9 +1117,6 @@ def home(request: Request, db=Depends(get_db)):
     user = current_user(request, db)
     if not user:
         return Response(login_page(), media_type="text/html")
-    if not user.approved and not is_admin(user):
-        return Response(login_page(notice="Waiting for the admin to confirm your Lichess name."),
-                        media_type="text/html")
     slices = json.dumps([{k: v for k, v in slice_.items() if k != "weight"} for slice_ in WHEEL],
                         ensure_ascii=False)
     return Response(index_page(user, state_of(db, user), slices), media_type="text/html")
@@ -1209,7 +1254,16 @@ def api_spins(request: Request, db=Depends(get_db)):
 
 
 # --- admin
+def emoji_of(label):
+    for slice_ in WHEEL:
+        if slice_["label"] == label:
+            return slice_["emoji"]
+    return ""
+
+
 def admin_rows(db):
+    blob = meta_get(db, "bank_rows", "")
+    known = {row["id"] for row in json.loads(blob)} if blob else set()
     out = []
     for u in db.query(User).order_by(User.id).all():
         delta = delta_for(db, u.id, u.applied_through or 0)
@@ -1218,7 +1272,8 @@ def admin_rows(db):
         out.append({"id": u.id, "display": u.display or u.lichess_id, "rank": u.bank_rank or "",
                     "bank": int(u.bank_bits or 0), "delta": delta,
                     "available": int(u.bank_bits or 0) + delta, "spins": cnt,
-                    "staked": int(staked or 0), "approved": bool(u.approved)})
+                    "staked": int(staked or 0),
+                    "in_bank": name_key(u.lichess_id) in known})
     return out
 
 
@@ -1280,17 +1335,6 @@ async def admin_upload(request: Request, file: UploadFile = File(...), db=Depend
     return RedirectResponse("/admin", status_code=303)
 
 
-@app.post("/admin/approve/{uid}")
-def admin_approve(uid: int, request: Request, db=Depends(get_db)):
-    if not admin_guard(request, db):
-        return Response("forbidden", status_code=403)
-    user = db.get(User, uid)
-    if user:
-        user.approved = True
-        db.commit()
-    return RedirectResponse("/admin", status_code=303)
-
-
 @app.post("/admin/apply")
 def admin_apply(request: Request, db=Depends(get_db)):
     if not admin_guard(request, db):
@@ -1308,13 +1352,18 @@ def admin_deltas(request: Request, db=Depends(get_db)):
         return Response("forbidden", status_code=403)
     buf = io.StringIO()
     w = csv.writer(buf)
+    owed = {}
+    for p in prize_rows(db):
+        owed.setdefault(name_key(p["display"]), []).append(
+            "%s x%s" % (p["label"], f"{p['qty']:,}"))
     w.writerow(["username", "rank", "spending_before", "delta_to_type_into_H",
-                "spending_after", "spins", "staked"])
+                "spending_after", "spins", "staked", "prizes_owed"])
     for r in admin_rows(db):
-        if r["delta"] == 0 and r["spins"] == 0:
+        prizes = "; ".join(owed.get(name_key(r["display"]), []))
+        if r["delta"] == 0 and r["spins"] == 0 and not prizes:
             continue
         w.writerow(["@" + str(r["display"]).lstrip("@"), r["rank"], r["bank"], r["delta"],
-                    r["available"], r["spins"], r["staked"]])
+                    r["available"], r["spins"], r["staked"], prizes])
     return PlainTextResponse(buf.getvalue(), media_type="text/csv",
                              headers={"Content-Disposition": 'attachment; filename="rh-deltas.csv"'})
 
