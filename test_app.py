@@ -11,6 +11,9 @@ os.environ.setdefault("BS_DB_URL", "sqlite:///" + os.path.join(tempfile.mkdtemp(
 os.environ.setdefault("BS_SECRET_KEY", "test-secret-do-not-reuse")
 os.environ.setdefault("BS_BASE_URL", "http://testserver")
 
+import urllib.error                                               # noqa: E402
+import urllib.parse                                                # noqa: E402
+
 import openpyxl                                                    # noqa: E402
 import pytest                                                      # noqa: E402
 from fastapi.testclient import TestClient                          # noqa: E402
@@ -483,3 +486,87 @@ def test_sacrifice_rebuilt_when_column_p_has_no_cached_value():
     row = main.parse_bank(buf.getvalue())[0]
     assert row["sacrificed"] == 6552                       # 26·27·28/3
     assert row["bits"] == 20_176_025_450 - 6_552_000_000
+
+
+# --------------------------------------------------------------------- lichess oauth
+def test_authorize_url_is_oauth_with_pkce():
+    url = main.lichess_url("st4te", "CHALLENGE")
+    assert url.startswith("https://lichess.org/oauth?")
+    q = urllib.parse.parse_qs(url.split("?", 1)[1])
+    assert q["response_type"] == ["code"]
+    assert q["code_challenge_method"] == ["S256"]
+    assert q["state"] == ["st4te"] and q["client_id"] == [main.LICHESS_CLIENT_ID]
+
+
+def test_token_endpoint_is_api_token(monkeypatch):
+    seen = {}
+
+    class Ok:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"access_token": "tok", "token_type": "Bearer"}'
+
+    def fake(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["body"] = urllib.parse.parse_qs(req.data.decode())
+        return Ok()
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", fake)
+    out = main.lichess_token("thecode", "theverifier")
+    assert seen["url"] == "https://lichess.org/api/token"
+    assert "oauth" not in seen["url"].replace("lichess.org/api/token", "")
+    assert seen["body"]["grant_type"] == ["authorization_code"]
+    assert seen["body"]["code"] == ["thecode"]
+    assert seen["body"]["code_verifier"] == ["theverifier"]
+    assert seen["body"]["client_id"] == [main.LICHESS_CLIENT_ID]
+    assert "client_secret" not in seen["body"]          # public client, no secret
+    assert out["access_token"] == "tok"
+
+
+def test_no_registration_credentials_are_needed():
+    assert main.LICHESS_AUTHORIZE == "https://lichess.org/oauth"
+    assert main.LICHESS_TOKEN == "https://lichess.org/api/token"
+    assert not hasattr(main, "LICHESS_CLIENT_SECRET")
+    assert main.LICHESS_CLIENT_ID and isinstance(main.LICHESS_CLIENT_ID, str)
+
+
+def test_token_errors_are_explained(monkeypatch):
+    body = io.BytesIO(b'{"error":"invalid_grant","error_description":"code expired"}')
+
+    def boom(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, body)
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", boom)
+    with pytest.raises(main.LichessError) as err:
+        main.lichess_token("x", "y" * 43)
+    assert "code expired" in str(err.value)
+
+
+def test_authorize_redirect_carries_pkce(client):
+    r = client.get("/auth/lichess", follow_redirects=False)
+    assert r.status_code in (302, 303, 307)
+    loc = r.headers["location"]
+    assert loc.startswith("https://lichess.org/oauth?")
+    assert "code_challenge_method=S256" in loc and "code_challenge=" in loc
+    assert "state=" in loc and "redirect_uri=" in loc
+    assert "bs_oauth" in r.cookies or "bs_oauth" in client.cookies
+
+
+def test_callback_signs_the_player_in(db, client, monkeypatch):
+    monkeypatch.setattr(main, "lichess_token", lambda code, verifier: {"access_token": "tok"})
+    monkeypatch.setattr(main, "lichess_account",
+                        lambda token: {"id": "alpha", "username": "Alpha"})
+    client.cookies.set("bs_oauth", main.sign({"state": "st", "verifier": "v" * 43}))
+    r = client.get("/auth/callback?code=abc&state=st", follow_redirects=False)
+    assert r.status_code in (302, 303, 307)
+    user = db.query(main.User).filter_by(lichess_id="alpha").one()
+    assert user.display == "Alpha"
+    assert client.get("/api/me").status_code == 200
+
+
+def test_callback_rejects_a_wrong_state(db, client, monkeypatch):
+    monkeypatch.setattr(main, "lichess_token", lambda c, v: {"access_token": "tok"})
+    client.cookies.set("bs_oauth", main.sign({"state": "one", "verifier": "v" * 43}))
+    r = client.get("/auth/callback?code=abc&state=two")
+    assert r.status_code == 400
+    assert db.query(main.User).count() == 0
