@@ -99,7 +99,7 @@ SAC_UNIT = 1_000_000                          # P is "BITS sacrificed, in millio
 
 SPIN_COST = int(env("BS_SPIN_COST", "300"))
 SPIN_TTL = int(env("BS_SPIN_TTL_SECONDS", "20"))
-MAX_WAGER = int(env("BS_MAX_WAGER", "50000"))
+MAX_WAGER = int(env("BS_MAX_WAGER", "5000000"))
 WAGER_MIN_RANK = env("BS_WAGER_MIN_RANK", "Sovereign")
 
 # The real wheel, from wheelofnames.com/2px-y84: same 16 slices, same order,
