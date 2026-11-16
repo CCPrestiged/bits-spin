@@ -60,7 +60,17 @@ def normalize_db_url(url: str) -> str:
 DB_URL = normalize_db_url(env("BS_DB_URL", "sqlite:///./bits_spin.db"))
 BASE_URL = env("BS_BASE_URL", "http://127.0.0.1:8000")
 
-ADMIN_LICHESS = env("BS_ADMIN_LICHESS", "cc_prestiged").lower()
+ADMIN_RAW = env("BS_ADMIN_LICHESS", "CC_Prestiged")
+
+
+def name_key(value) -> str:
+    """One canonical form for a Lichess name: no case, no spaces, no leading @.
+    Everything that compares names against BS_ADMIN_LICHESS goes through this, so
+    "CC_Prestiged", "cc_prestiged" and "  @CC_Prestiged " are the same account."""
+    return str(value or "").strip().lstrip("@").lower()
+
+
+ADMIN_LICHESS = name_key(ADMIN_RAW)
 ADMIN_KEY = env("BS_ADMIN_KEY", "")          # optional break-glass, off unless set
 
 ALLOW_LOCAL = env("BS_ALLOW_LOCAL", "1") == "1"
@@ -417,7 +427,7 @@ def parse_bank(blob: bytes) -> list[dict]:
             # cached values, rebuild it from the prestige level instead of reading zero.
             sac = prestige * (prestige + 1) * (prestige + 2) // 3
         rows.append({
-            "id": display.lower(),
+            "id": name_key(display),
             "display": display,
             "bits": total - sac * SAC_UNIT,          # J - P*1,000,000
             "total": total,
@@ -436,7 +446,7 @@ def sync_bank(db, blob=None, origin=None) -> dict:
     by_id = {r["id"]: r for r in rows}
     touched = 0
     for user in db.query(User).all():
-        row = by_id.get((user.lichess_id or "").lower())
+        row = by_id.get(name_key(user.lichess_id))
         if not row:
             continue
         user.bank_bits, user.bank_rank = row["bits"], row["rank"]
@@ -455,7 +465,7 @@ def bank_row(db, lichess_id):
     blob = meta_get(db, "bank_rows", "")
     if not blob:
         return None
-    lid = (lichess_id or "").lower()
+    lid = name_key(lichess_id)
     for row in json.loads(blob):
         if row["id"] == lid:
             return row
@@ -1005,7 +1015,7 @@ def is_admin(user) -> bool:
         return False
     if user.is_admin:                       # only ever set by a bank sync or by you, in the DB
         return True
-    return not user.password_hash and (user.lichess_id or "").lower() == ADMIN_LICHESS
+    return not user.password_hash and name_key(user.lichess_id) == ADMIN_LICHESS
 
 
 def state_of(db, user):
@@ -1023,9 +1033,16 @@ def login_cookie(resp, user):
 
 
 def ensure_admin_flag(db, user):
-    if (not user.password_hash) and (user.lichess_id or "").lower() == ADMIN_LICHESS \
-            and not user.is_admin:
-        user.is_admin = True
+    """Called on every successful login. The admin is never left waiting for approval:
+    before the first bank upload there is nobody else to approve them."""
+    if user.password_hash or name_key(user.lichess_id) != ADMIN_LICHESS:
+        return
+    changed = False
+    if not user.is_admin:
+        user.is_admin, changed = True, True
+    if not user.approved:
+        user.approved, changed = True, True
+    if changed:
         db.commit()
 
 
@@ -1052,7 +1069,7 @@ def home(request: Request, db=Depends(get_db)):
     user = current_user(request, db)
     if not user:
         return Response(login_page(), media_type="text/html")
-    if not user.approved:
+    if not user.approved and not is_admin(user):
         return Response(login_page(notice="Waiting for the admin to confirm your Lichess name."),
                         media_type="text/html")
     slices = json.dumps([{k: v for k, v in slice_.items() if k != "weight"} for slice_ in WHEEL],
@@ -1102,7 +1119,7 @@ def auth_local(username: str = Form(...), password: str = Form(...), mode: str =
         return Response(login_page("Use the Lichess button. Local accounts are turned off."),
                         media_type="text/html", status_code=403)
     lid = username.strip().lstrip("@").lower()
-    if lid == ADMIN_LICHESS:
+    if name_key(lid) == ADMIN_LICHESS:
         return Response(login_page("The admin account must be signed in with Lichess."),
                         media_type="text/html", status_code=403)
     if not lid or " " in lid:
@@ -1224,8 +1241,14 @@ def admin_guard(request, db):
 @app.get("/admin", response_class=Response)
 def admin_home(request: Request, db=Depends(get_db)):
     if not admin_guard(request, db):
-        return Response(login_page("Admin is the Lichess account @CC_Prestiged. Log in with it."),
-                        media_type="text/html", status_code=403)
+        who = current_user(request, db)
+        if who:
+            message = ("You are signed in as @%s, but this page belongs to @%s. If that is the "
+                       "wrong name, fix BS_ADMIN_LICHESS in your host's environment settings."
+                       % (who.lichess_id, ADMIN_RAW.strip().lstrip("@")))
+        else:
+            message = "Admin is the Lichess account @%s. Log in with it." % ADMIN_RAW.strip().lstrip("@")
+        return Response(login_page(message), media_type="text/html", status_code=403)
     rows_blob = meta_get(db, "bank_rows", "")
     meta = {"bank_synced_at": meta_get(db, "bank_synced_at", ""),
             "bank_players": len(json.loads(rows_blob)) if rows_blob else 0}
