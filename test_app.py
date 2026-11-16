@@ -18,6 +18,8 @@ import openpyxl                                                    # noqa: E402
 import pytest                                                      # noqa: E402
 from fastapi.testclient import TestClient                          # noqa: E402
 
+from sqlalchemy import select                                     # noqa: E402
+
 import main                                                        # noqa: E402
 
 CC = "cc_prestiged"
@@ -58,6 +60,15 @@ def force_index(db, spin, index):
     spin.commit = main.commit_of(spin.seed)
     db.commit()
     return spin
+
+
+def finish(db, user, spin, index=None):
+    """reveal and collect in one go, with the clock pushed past the reveal delay"""
+    later = main.utcnow() + __import__("datetime").timedelta(seconds=main.REVEAL_AFTER + 1)
+    if index is not None:
+        force_index(db, spin, index)
+    main.reveal_spin(db, user, spin.id, now=later)
+    return main.claim_spin(db, user, spin.id, now=later)
 
 
 def workbook(rows, sheet=main.BANK_SHEET):
@@ -221,7 +232,7 @@ def test_bits_prize_is_multiplied_by_wager(db):
     user = mkuser(db, "sov", bits=10**9)
     spin, _cost, _ = main.start_spin(db, user, 1000)
     force_index(db, spin, 11)                          # 1000 BITS
-    spin, fresh = main.settle_spin(db, user, spin.id)
+    spin, fresh = finish(db, user, spin)
     assert fresh and spin.payout == 1_000_000
     assert spin.prize_qty == 0
 
@@ -231,7 +242,7 @@ def test_moving_logo_is_multiplied_by_wager(db):
     spin, cost, _ = main.start_spin(db, user, 30_000)
     assert cost == 9_000_000
     force_index(db, spin, 13)                          # Moving Logo
-    spin, _ = main.settle_spin(db, user, spin.id)
+    spin, _ = finish(db, user, spin)
     assert spin.label == "Moving Logo"
     assert spin.kind == "prize"
     assert spin.prize_qty == 30_000
@@ -243,7 +254,7 @@ def test_two_more_spins_is_never_multiplied(db):
     for wager in (1, 3, 1000, 30_000):
         spin, _c, _ = main.start_spin(db, user, wager)
         force_index(db, spin, 15)
-        spin, _ = main.settle_spin(db, user, spin.id)
+        spin, _ = finish(db, user, spin)
         assert spin.label == "2 More Spins"
         assert spin.prize_qty == 2, wager
 
@@ -253,7 +264,7 @@ def test_logos_and_prefixes_do_multiply(db):
     for index, label in ((12, "Static Logo"), (13, "Moving Logo"), (14, "Custom Prefix")):
         spin, _c, _ = main.start_spin(db, user, 50)
         force_index(db, spin, index)
-        spin, _ = main.settle_spin(db, user, spin.id)
+        spin, _ = finish(db, user, spin)
         assert (spin.label, spin.prize_qty) == (label, 50)
 
 
@@ -263,7 +274,7 @@ def test_below_sovereign_gets_exactly_one_prize(db):
         spin, cost, _ = main.start_spin(db, user, 500)      # 500 is ignored, wager forced to 1
         assert cost == 300
         force_index(db, spin, index)
-        spin, _ = main.settle_spin(db, user, spin.id)
+        spin, _ = finish(db, user, spin)
         assert spin.prize_qty == 1
 
 
@@ -280,17 +291,18 @@ def test_expired_spin_is_forfeited(db):
     spin.expires_at = main.utcnow() - __import__("datetime").timedelta(seconds=1)
     db.commit()
     with pytest.raises(main.Refused):
-        main.settle_spin(db, user, spin.id)
+        main.reveal_spin(db, user, spin.id)
     assert db.get(main.Spin, spin.id).status == "forfeited"
     assert main.available_bits(db, user) == 700        # refunded nothing
 
 
-def test_settle_twice_pays_once(db):
+def test_claiming_twice_pays_once(db):
     user = mkuser(db, "sov", bits=1_000_000)
     spin, _c, _ = main.start_spin(db, user, 1)
     force_index(db, spin, 2)                           # 100 BITS
-    main.settle_spin(db, user, spin.id)
-    _spin, fresh = main.settle_spin(db, user, spin.id)
+    finish(db, user, spin)
+    later = main.utcnow() + __import__("datetime").timedelta(seconds=main.REVEAL_AFTER + 2)
+    _spin, fresh = main.claim_spin(db, user, spin.id, now=later)
     assert fresh is False
     assert main.available_bits(db, user) == 1_000_000 - 300 + 100
 
@@ -299,7 +311,7 @@ def test_commit_reveal_verifies(db):
     user = mkuser(db, "sov", bits=1_000_000)
     spin, _c, _ = main.start_spin(db, user, 1)
     commit = spin.commit
-    main.settle_spin(db, user, spin.id)
+    finish(db, user, spin)
     assert main.commit_of(spin.seed) == commit
     assert main.pick_index(spin.seed) == spin.index_landed
 
@@ -342,7 +354,7 @@ def test_admin_sees_prize_obligation(db, client):
     winner = mkuser(db, "winner", bits=10**9)
     spin, _c, _ = main.start_spin(db, winner, 30_000)
     force_index(db, spin, 13)
-    main.settle_spin(db, winner, spin.id)
+    finish(db, winner, spin)
     login(client, admin.id)
     page = client.get("/admin").text
     assert "Moving Logo" in page and "30,000" in page
@@ -387,7 +399,8 @@ def test_api_needs_a_session(client):
     assert client.post("/api/spin", json={"wager": 1}).status_code == 401
 
 
-def test_full_spin_round_trip(db, client):
+def test_full_spin_round_trip(db, client, monkeypatch):
+    monkeypatch.setattr(main, "REVEAL_AFTER", 0)        # no waiting in a unit test
     user = mkuser(db, "player", rank="Sovereign", bits=1_000_000)
     login(client, user.id)
     assert "Sign in" not in client.get("/").text
@@ -395,9 +408,15 @@ def test_full_spin_round_trip(db, client):
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["cost"] == 1500 and data["balance"] == 998_500
-    s = client.post("/api/spin/%s/settle" % data["spin_id"]).json()
-    assert s["check"]["sha256_seed"] is True
-    assert s["index"] == s["check"]["index_from_seed"]
+    assert data["reveal_after"] == 0
+    rev = client.post("/api/spin/%s/reveal" % data["spin_id"]).json()
+    assert rev["check"]["sha256_seed"] is True
+    assert rev["index"] == rev["check"]["index_from_seed"]
+    assert main.Spin is not None
+    assert db.execute(select(main.Spin.status)).scalars().all() == ["revealed"]
+    paid = client.post("/api/spin/%s/claim" % data["spin_id"]).json()
+    assert paid["status"] == "settled"
+    assert paid["paid"] == rev["payout"]
     log = client.get("/api/spins").json()
     assert log[0]["status"] == "settled"
 
@@ -651,7 +670,7 @@ def test_deltas_csv_carries_the_prizes(db, client):
     for index, wager in ((13, 2), (13, 1), (12, 4)):
         spin, _c, _ = main.start_spin(db, player, wager)
         force_index(db, spin, index)
-        main.settle_spin(db, player, spin.id)
+        finish(db, player, spin)
     login(client, admin.id)
     text = client.get("/admin/deltas.csv").text
     head, row = text.splitlines()[0], text.splitlines()[1]
@@ -667,7 +686,7 @@ def test_prize_csv_and_admin_table_keep_emoji_out_of_the_csv(db, client):
     player = mkuser(db, "winner", bits=10**8)
     spin, _c, _ = main.start_spin(db, player, 2)
     force_index(db, spin, 13)
-    main.settle_spin(db, player, spin.id)
+    finish(db, player, spin)
     login(client, admin.id)
     csv_text = client.get("/admin/prizes.csv").text
     assert "Moving Logo,2" in csv_text and "\U0001F39E" not in csv_text
@@ -682,3 +701,139 @@ def test_admin_sees_who_is_not_in_the_bank(db, client):
     login(client, admin.id)
     page = client.get("/admin").text
     assert "not in bank" in page and "in bank" in page
+
+
+# --------------------------------------------------------------------- leaving mid-spin
+def test_reveal_waits_for_the_wheel(db):
+    user = mkuser(db, "sov", bits=10**6)
+    spin, _c, _ = main.start_spin(db, user, 1)
+    with pytest.raises(main.Refused) as err:
+        main.reveal_spin(db, user, spin.id)
+    assert "still turning" in str(err.value)
+    assert db.get(main.Spin, spin.id).status == "pending"
+
+
+def test_claim_before_reveal_is_refused(db):
+    user = mkuser(db, "sov", bits=10**6)
+    spin, _c, _ = main.start_spin(db, user, 1)
+    with pytest.raises(main.Refused) as err:
+        main.claim_spin(db, user, spin.id)
+    assert "has not stopped" in str(err.value)
+
+
+def test_closing_the_page_before_the_reveal_loses_the_wager(db):
+    user = mkuser(db, "sov", bits=1_000)
+    spin, _c, after = main.start_spin(db, user, 1)
+    assert after == 700
+    spin.expires_at = main.utcnow() - __import__("datetime").timedelta(seconds=1)
+    db.commit()
+    main.sweep(db)
+    assert db.get(main.Spin, spin.id).status == "forfeited"
+    assert main.available_bits(db, user) == 700            # the 300 is gone, nothing came back
+
+
+def test_closing_the_page_after_the_reveal_loses_the_prize(db):
+    user = mkuser(db, "sov", bits=10**7)
+    spin, _c, _ = main.start_spin(db, user, 2)
+    force_index(db, spin, 13)                              # Moving Logo x2
+    later = main.utcnow() + __import__("datetime").timedelta(seconds=main.REVEAL_AFTER + 1)
+    main.reveal_spin(db, user, spin.id, now=later)
+    assert db.get(main.Spin, spin.id).status == "revealed"
+    assert db.get(main.Spin, spin.id).prize_qty == 2
+
+    spin = db.get(main.Spin, spin.id)
+    spin.expires_at = main.utcnow() - __import__("datetime").timedelta(seconds=1)
+    db.commit()
+    main.sweep(db)
+    assert db.get(main.Spin, spin.id).status == "forfeited"   # seen, not collected
+    assert main.available_bits(db, user) == 10**7 - 600
+    assert db.query(main.Ledger).filter_by(reason="payout").count() == 0
+    with pytest.raises(main.Refused):
+        main.claim_spin(db, user, spin.id)
+
+
+def test_a_forfeited_prize_is_not_owed_to_the_admin(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    player = mkuser(db, "quitter", bits=10**7)
+    spin, _c, _ = main.start_spin(db, player, 1)
+    force_index(db, spin, 12)                              # Static Logo
+    later = main.utcnow() + __import__("datetime").timedelta(seconds=main.REVEAL_AFTER + 1)
+    main.reveal_spin(db, player, spin.id, now=later)
+    spin = db.get(main.Spin, spin.id)
+    spin.expires_at = main.utcnow() - __import__("datetime").timedelta(seconds=1)
+    db.commit()
+    main.sweep(db)
+    login(client, admin.id)
+    assert "Static Logo" not in client.get("/admin/prizes.csv").text
+
+
+def test_forfeit_shows_up_as_you_left(db, client, monkeypatch):
+    monkeypatch.setattr(main, "REVEAL_AFTER", 0)
+    user = mkuser(db, "quitter", bits=1_000)
+    spin, _c, _ = main.start_spin(db, user, 1)
+    spin.expires_at = main.utcnow() - __import__("datetime").timedelta(seconds=1)
+    db.commit()
+    login(client, user.id)
+    rows = client.get("/api/spins").json()
+    assert rows[0]["status"] == "forfeited" and rows[0]["cost"] == 300
+
+
+# --------------------------------------------------------------------- admin popup
+def test_admin_player_popup_feed(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    player = mkuser(db, "watched", bits=10**8)
+    won, _c, _ = main.start_spin(db, player, 3)
+    force_index(db, won, 11)                               # 1000 BITS x3
+    finish(db, player, won)
+    lost, _c, _ = main.start_spin(db, player, 1)
+    force_index(db, lost, 2)
+    later = main.utcnow() + __import__("datetime").timedelta(seconds=main.REVEAL_AFTER + 1)
+    main.reveal_spin(db, player, lost.id, now=later)
+    lost = db.get(main.Spin, lost.id)
+    lost.expires_at = main.utcnow() - __import__("datetime").timedelta(seconds=1)
+    db.commit()
+    main.sweep(db)
+
+    login(client, admin.id)
+    d = client.get("/admin/player/%d.json" % player.id).json()
+    assert d["display"] == "watched" and d["summary"]["spins"] == 2
+    assert d["summary"]["collected"] == 1
+    assert d["summary"]["forfeited"] == 1
+    assert d["summary"]["best"] == 3000
+    statuses = sorted(x["status"] for x in d["spins"])
+    assert statuses == ["forfeited", "settled"]
+    assert any(x["emoji"] == "\U0001F451" for x in d["spins"])
+
+
+def test_admin_player_popup_is_admin_only(db, client):
+    player = mkuser(db, "watched", bits=10**6)
+    assert client.get("/admin/player/%d.json" % player.id).status_code == 403
+    login(client, player.id)
+    assert client.get("/admin/player/%d.json" % player.id).status_code == 403
+    assert client.get("/admin/player/9999.json").status_code == 403
+
+
+def test_admin_page_has_clickable_rows_and_the_overlay(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    mkuser(db, "watched", bits=10**6)
+    login(client, admin.id)
+    page = client.get("/admin").text
+    assert 'class=prow data-uid=' in page
+    assert 'id=pmodal' in page and "pmBody" in page
+
+
+# --------------------------------------------------------------------- the sentence
+def test_delta_line_wording_and_colour():
+    assert "minus 225" in main.delta_line(-225) and "d-neg" in main.delta_line(-225)
+    assert "plus 1,440" in main.delta_line(1440) and "d-pos" in main.delta_line(1440)
+    assert "unchanged" in main.delta_line(0) and "<b" not in main.delta_line(0)
+
+
+def test_balance_sentence_on_the_page(db, client, monkeypatch):
+    monkeypatch.setattr(main, "REVEAL_AFTER", 0)
+    user = mkuser(db, "sov", bits=1_000)
+    main.start_spin(db, user, 1)                          # -300 in the ledger
+    login(client, user.id)
+    page = client.get("/").text
+    assert "Your remaining BITS shown above is your BITS Bank figure" in page
+    assert '<b class="d-neg">minus 300</b>' in page
