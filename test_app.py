@@ -570,3 +570,64 @@ def test_callback_rejects_a_wrong_state(db, client, monkeypatch):
     r = client.get("/auth/callback?code=abc&state=two")
     assert r.status_code == 400
     assert db.query(main.User).count() == 0
+
+
+# --------------------------------------------------------------------- admin casing
+def test_name_key_folds_case_space_and_at():
+    assert main.name_key("CC_Prestiged") == main.name_key("  @cc_Prestiged ") == "cc_prestiged"
+    assert main.name_key(None) == "" and main.name_key("") == ""
+
+
+def test_admin_survives_a_messy_env_value(db, monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_LICHESS", main.name_key("  @CC_Prestiged\n"))
+    user = mkuser(db, "cc_prestiged", bits=1)
+    assert main.is_admin(user) is True
+
+
+def test_admin_with_any_casing_wins(db, monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_LICHESS", main.name_key("CC_PRESTIGED"))
+    user = mkuser(db, "CC_Prestiged", bits=1)
+    assert main.is_admin(user) is True
+
+
+def test_first_login_before_any_bank_upload(db, client, monkeypatch):
+    """The catch-22: nobody is approved until the bank is uploaded, and only the admin can
+    upload it. The admin must be usable on the very first login."""
+    monkeypatch.setattr(main, "ADMIN_LICHESS", main.name_key("CC_Prestiged"))
+    monkeypatch.setattr(main, "lichess_token", lambda c, v: {"access_token": "t"})
+    monkeypatch.setattr(main, "lichess_account",
+                        lambda t: {"id": "cc_prestiged", "username": "CC_Prestiged"})
+    client.cookies.set("bs_oauth", main.sign({"state": "st", "verifier": "v" * 43}))
+    assert client.get("/auth/callback?code=c&state=st", follow_redirects=False).status_code in (302, 303, 307)
+
+    user = db.query(main.User).filter_by(lichess_id="cc_prestiged").one()
+    assert user.approved is True and user.is_admin is True
+    assert "Waiting for the admin" not in client.get("/").text
+    assert client.get("/admin").status_code == 200
+
+
+def test_a_pending_admin_still_gets_the_wheel(db, client):
+    user = mkuser(db, CC, bits=1, approved=False)
+    login(client, user.id)
+    page = client.get("/").text
+    assert "Waiting for the admin" not in page
+    assert "id=wheel" in page
+
+
+def test_a_normal_player_is_still_held_back(db, client):
+    user = mkuser(db, "newbie", bits=1, approved=False)
+    login(client, user.id)
+    assert "Waiting for the admin" in client.get("/").text
+
+
+def test_admin_403_says_who_you_are(db, client):
+    user = mkuser(db, "someone", bits=1)
+    login(client, user.id)
+    r = client.get("/admin")
+    assert r.status_code == 403
+    assert "@someone" in r.text and main.ADMIN_RAW.lstrip("@") in r.text
+
+
+def test_admin_403_asks_for_a_login_when_anonymous(client):
+    r = client.get("/admin")
+    assert r.status_code == 403 and "Log in with it" in r.text
