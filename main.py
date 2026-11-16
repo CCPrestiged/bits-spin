@@ -970,7 +970,7 @@ def index_page(user, state, slices_json):
   <div class=card>
     <div class=lab>Spending BITS · tentative until the bank is updated</div>
     <div class=balance id=balance>%s</div>
-    <div class=hint>Bank figure %s %s everything you have done here since the admin last updated.
+    <div class=hint>Bank figure <b>%s %s</b> - everything you have done here since the admin last updated.
       <a href="%s" target=_blank rel=noopener>How BITS work</a></div>
     <hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
     <div class=lab>Wager</div>
