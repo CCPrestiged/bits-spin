@@ -102,7 +102,7 @@ SPIN_TTL = int(env("BS_SPIN_TTL_SECONDS", "30"))
 # The wheel must actually turn before the result is revealed. Anything closed before this
 # many seconds is a forfeit, which is the whole point of the timer.
 REVEAL_AFTER = float(env("BS_REVEAL_SECONDS", "3.6"))
-MAX_WAGER = int(env("BS_MAX_WAGER", "50000"))
+MAX_WAGER = int(env("BS_MAX_WAGER", "1000000000"))
 WAGER_MIN_RANK = env("BS_WAGER_MIN_RANK", "Sovereign")
 
 # The real wheel, from wheelofnames.com/2px-y84: same 16 slices, same order,
