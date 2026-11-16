@@ -30,6 +30,7 @@ import io
 import json
 import os
 import secrets
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -63,8 +64,16 @@ ADMIN_LICHESS = env("BS_ADMIN_LICHESS", "cc_prestiged").lower()
 ADMIN_KEY = env("BS_ADMIN_KEY", "")          # optional break-glass, off unless set
 
 ALLOW_LOCAL = env("BS_ALLOW_LOCAL", "1") == "1"
+# Lichess has retired app registration (/account/oauth/app is gone) and expects public
+# clients only. Their own error message for a missing client_id is "client_id required
+# (choose any)", so this string is simply an identifier, not a registered application,
+# and there is no secret anywhere. PKCE does the work instead.
+#
+#   browser  -> https://lichess.org/oauth        the consent page, with the S256 challenge
+#   server   -> https://lichess.org/api/token    code -> token, once. Never /oauth.
+LICHESS_AUTHORIZE = "https://lichess.org/oauth"
+LICHESS_TOKEN = "https://lichess.org/api/token"
 LICHESS_CLIENT_ID = env("BS_LICHESS_CLIENT_ID", "real-humans-spins")
-LICHESS_CLIENT_SECRET = env("BS_LICHESS_CLIENT_SECRET", "")
 LICHESS_REDIRECT = env("BS_LICHESS_REDIRECT", BASE_URL.rstrip("/") + "/auth/callback")
 
 BANK_FILE = env("BS_BANK_FILE", "")
@@ -522,24 +531,39 @@ def pkce():
     return verifier, _b64(hashlib.sha256(verifier.encode()).digest())
 
 
+class LichessError(Exception):
+    pass
+
+
 def lichess_url(state, challenge):
-    return "https://lichess.org/oauth?" + urllib.parse.urlencode({
+    return LICHESS_AUTHORIZE + "?" + urllib.parse.urlencode({
         "response_type": "code", "client_id": LICHESS_CLIENT_ID,
         "redirect_uri": LICHESS_REDIRECT, "scope": "preference:read",
         "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
 
 
 def lichess_token(code, verifier):
+    """Swap the one-time code for a token at /api/token. PKCE, no secret."""
     data = {"grant_type": "authorization_code", "code": code,
-            "redirect_uri": LICHESS_REDIRECT, "client_id": LICHESS_CLIENT_ID,
-            "code_verifier": verifier}
-    if LICHESS_CLIENT_SECRET:
-        data["client_secret"] = LICHESS_CLIENT_SECRET
-    req = urllib.request.Request("https://lichess.org/api/oauth/token",
-                                 data=urllib.parse.urlencode(data).encode(),
-                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read())
+            "code_verifier": verifier, "redirect_uri": LICHESS_REDIRECT,
+            "client_id": LICHESS_CLIENT_ID}
+    req = urllib.request.Request(
+        LICHESS_TOKEN, data=urllib.parse.urlencode(data).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            body = json.loads(exc.read())
+            detail = body.get("error_description") or body.get("error") or ""
+        except Exception:                                  # noqa: BLE001
+            detail = ""
+        raise LichessError(detail or "Lichess answered %s" % exc.code) from None
+    except Exception as exc:                               # noqa: BLE001
+        raise LichessError("could not reach lichess.org (%s)" % exc) from None
 
 
 def lichess_account(token):
@@ -1054,6 +1078,9 @@ def auth_callback(request: Request, code: str = "", state: str = "", db=Depends(
                         status_code=400)
     try:
         acc = lichess_account(lichess_token(code, blob["verifier"])["access_token"])
+    except LichessError as exc:
+        return Response(login_page("Lichess did not finish the login: %s." % exc),
+                        media_type="text/html", status_code=502)
     except Exception as exc:                              # noqa: BLE001
         return Response(login_page("Lichess did not finish the login (%s)." % exc),
                         media_type="text/html", status_code=502)
