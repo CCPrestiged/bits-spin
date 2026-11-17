@@ -1285,6 +1285,13 @@ PLAYER_MODAL = """
 """
 
 
+def nicetime(raw):
+    try:
+        return _aware(dt.datetime.fromisoformat(raw)).strftime("%d %b %Y, %H:%M UTC")
+    except (TypeError, ValueError):
+        return ""
+
+
 def admin_page(rows, prizes, meta):
     body = "".join(
         "<tr class=prow data-uid=\"%d\" title=\"Click for this player's spins\">"
@@ -1301,6 +1308,12 @@ def admin_page(rows, prizes, meta):
                          % (esc(p["display"]), emoji_of(p["label"]), esc(p["label"]),
                             f"{p['qty']:,}")
                          for p in prizes)
+    if not prize_rows:
+        prize_rows = ('<tr><td colspan=3 class=hint style="padding:14px 6px">Nothing owed right now.'
+                      '</td></tr>')
+    cleared = nicetime(meta.get("prizes_since") or "")
+    cleared_note = ("Cleared " + cleared + "." if cleared else
+                    "Nothing cleared yet, so this is every prize ever won.")
     return page("""
 <header class=top><div class=brand>Real Humans · <b>admin</b></div>
 <div class=spacer></div><span class=pill>%s players in the bank</span>
@@ -1310,10 +1323,11 @@ def admin_page(rows, prizes, meta):
   <p class=hint>Everything you have to do is in one file: <b>Deltas + prizes</b>. Type each delta
   into column H of the sheet (that moves J, and J − P×1e6 is the spending figure), hand out the
   prizes in the last column, then <b>Sync bank</b> and <b>Mark applied</b>. Nothing is written
-  for you. Someone marked <i>not in bank</i> has no BITS, so they cannot spin yet.</p>
+  for you. Mark applied sets both lists back to zero: the Deltas file and the prize obligations
+  below. Someone marked <i>not in bank</i> has no BITS, so they cannot spin yet.</p>
   <form method=post action="/admin/sync" style="display:inline"><button class=primary>Sync bank</button></form>
   <form method=post action="/admin/apply" style="display:inline"
-    onsubmit="return confirm('Have you already typed these deltas into the sheet?')">
+    onsubmit="return confirm('Deltas typed into the sheet and prizes handed out? This clears both lists.')">
     <button>Mark applied</button></form>
   <a class=btn href="/admin/deltas.csv" style="text-decoration:none;display:inline-block">Deltas + prizes</a>
   <a class=btn href="/admin/spins.csv" style="text-decoration:none;display:inline-block">Every spin</a>
@@ -1323,13 +1337,16 @@ def admin_page(rows, prizes, meta):
     <input type=file name=file accept=.xlsx style="margin:8px 0"><button>Upload and sync</button></form>
 </div>
 <div class=card style="margin-bottom:18px"><div class=lab>Prize obligations</div>
-  <p class=hint>A wager of 30,000 landing on Moving Logo owes 30,000 moving logos.</p>
+  <p class=hint>A wager of 30,000 landing on Moving Logo owes 30,000 moving logos. Only prizes won
+  since the last <b>Mark applied</b> are listed: pressing it empties this card and the prizes_owed
+  column of the Deltas file. <i>%s</i></p>
   <table><thead><tr><th>Player</th><th>Prize</th><th>Owed</th></tr></thead><tbody>%s</tbody></table></div>
 <div class=card><div class=lab>Players</div>
   <table><thead><tr><th>Player</th><th>Rank</th><th>Bank</th><th>Delta</th><th>Available</th>
   <th>Spins</th><th>Staked</th><th>Account</th></tr></thead><tbody>%s</tbody></table></div>
 <footer>Admin is the Lichess account @CC_Prestiged.</footer>
-""" % (meta["bank_players"], esc(meta["bank_synced_at"] or "never"), prize_rows, body) + PLAYER_MODAL)
+""" % (meta["bank_players"], esc(meta["bank_synced_at"] or "never"), cleared_note,
+       prize_rows, body) + PLAYER_MODAL)
 
 
 # --------------------------------------------------------------------------- app
@@ -1593,11 +1610,24 @@ def admin_rows(db):
     return out
 
 
+def prizes_since(db):
+    """Prizes are an obligation only until they have been handed out. 'Mark applied'
+    stamps the moment, and that stamp is what empties the list."""
+    raw = meta_get(db, "prizes_applied_at", "")
+    try:
+        return _aware(dt.datetime.fromisoformat(raw)) if raw else None
+    except ValueError:
+        return None
+
+
 def prize_rows(db):
+    since = prizes_since(db)
     q = (select(User.display, User.lichess_id, Spin.label, func.sum(Spin.prize_qty))
          .join(User, Spin.user_id == User.id)
-         .where(Spin.prize_qty > 0, Spin.status == "settled", Spin.kind != "free")
-         .group_by(User.id, Spin.label).order_by(func.sum(Spin.prize_qty).desc()))
+         .where(Spin.prize_qty > 0, Spin.status == "settled", Spin.kind != "free"))
+    if since:
+        q = q.where(Spin.settled_at > since)
+    q = q.group_by(User.id, Spin.label).order_by(func.sum(Spin.prize_qty).desc())
     return [{"display": d or l, "label": lab, "qty": int(qty)} for d, l, lab, qty in db.execute(q)]
 
 
@@ -1622,8 +1652,10 @@ def admin_home(request: Request, db=Depends(get_db)):
             message = "Admin is the Lichess account @%s. Log in with it." % ADMIN_RAW.strip().lstrip("@")
         return Response(login_page(message), media_type="text/html", status_code=403)
     rows_blob = meta_get(db, "bank_rows", "")
+    since = prizes_since(db)
     meta = {"bank_synced_at": meta_get(db, "bank_synced_at", ""),
-            "bank_players": len(json.loads(rows_blob)) if rows_blob else 0}
+            "bank_players": len(json.loads(rows_blob)) if rows_blob else 0,
+            "prizes_since": since.isoformat() if since else ""}
     return Response(admin_page(admin_rows(db), prize_rows(db), meta), media_type="text/html")
 
 
@@ -1656,9 +1688,11 @@ async def admin_upload(request: Request, file: UploadFile = File(...), db=Depend
 def admin_apply(request: Request, db=Depends(get_db)):
     if not admin_guard(request, db):
         return Response("forbidden", status_code=403)
+    now = utcnow()
     for u in db.query(User).all():
         last = db.execute(select(func.max(Ledger.id)).where(Ledger.user_id == u.id)).scalar()
         u.applied_through = int(last or 0)
+    meta_set(db, "prizes_applied_at", now.isoformat())      # prize list starts empty again
     db.commit()
     return RedirectResponse("/admin", status_code=303)
 
