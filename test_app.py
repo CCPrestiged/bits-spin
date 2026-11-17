@@ -94,6 +94,20 @@ def login(client, user_id):
     return client
 
 
+class Clock:
+    """A utcnow() you can move by hand, so 'before' and 'after' are not a race."""
+
+    def __init__(self, start):
+        self.t = start
+
+    def __call__(self):
+        return self.t
+
+    def tick(self, seconds):
+        self.t = self.t + __import__("datetime").timedelta(seconds=seconds)
+        return self.t
+
+
 # --------------------------------------------------------------------- ranks
 @pytest.mark.parametrize("raw,expected", [
     ("Bronze \U0001FA94", "Bronze"),
@@ -369,6 +383,79 @@ def test_admin_sees_prize_obligation(db, client):
     assert "Moving Logo,30000" in csv_text
     spins_csv = client.get("/admin/spins.csv").text
     assert "prize_owed" in spins_csv and ",30000," in spins_csv
+
+
+def test_mark_applied_empties_the_prize_list(db, client, monkeypatch):
+    clock = Clock(main.utcnow())
+    monkeypatch.setattr(main, "utcnow", clock)
+    admin = mkuser(db, CC, bits=10**9)
+    winner = mkuser(db, "winner", bits=10**9)
+    spin, _c, _ = main.start_spin(db, winner, 30_000)
+    finish(db, winner, spin, index=13)                     # Moving Logo x30,000
+    clock.tick(120)
+    login(client, admin.id)
+    assert "Moving Logo</td>" in client.get("/admin").text
+    assert client.post("/admin/apply", follow_redirects=False).status_code == 303
+    page = client.get("/admin").text
+    assert "Moving Logo</td>" not in page
+    assert "Nothing owed right now." in page
+    assert client.get("/admin/prizes.csv").text.strip().splitlines() == ["username,prize,owed"]
+    deltas = client.get("/admin/deltas.csv").text.strip().splitlines()
+    assert deltas[0].endswith("prizes_owed") and all("Logo" not in row for row in deltas[1:])
+
+
+def test_prizes_won_after_the_stamp_show_again(db, client, monkeypatch):
+    clock = Clock(main.utcnow())
+    monkeypatch.setattr(main, "utcnow", clock)
+    admin = mkuser(db, CC, bits=10**9)
+    winner = mkuser(db, "winner", bits=10**9)
+    first, _c, _ = main.start_spin(db, winner, 1)
+    finish(db, winner, first, index=13)
+    clock.tick(120)
+    login(client, admin.id)
+    client.post("/admin/apply")
+    later, _c, _ = main.start_spin(db, winner, 1)
+    finish(db, winner, later, index=14)                    # Custom Prefix, wager 1
+    page = client.get("/admin").text
+    assert "Custom Prefix</td>" in page
+    assert "Moving Logo</td>" not in page
+    assert client.get("/admin/prizes.csv").text.strip().splitlines()[1] == "@winner,Custom Prefix,1"
+
+
+def test_a_prize_that_lands_after_mark_applied_is_still_owed(db, client, monkeypatch):
+    """The stamp is a moment in time, not a spin counter: a spin started before it but
+    collected after it has not been handed out yet, so it must stay on the list."""
+    clock = Clock(main.utcnow())
+    monkeypatch.setattr(main, "utcnow", clock)
+    admin = mkuser(db, CC, bits=10**9)
+    winner = mkuser(db, "winner", bits=10**9)
+    spin, _c, _ = main.start_spin(db, winner, 5)
+    clock.tick(1)
+    login(client, admin.id)
+    client.post("/admin/apply")
+    assert "Custom Prefix</td>" not in client.get("/admin").text
+    clock.tick(4)                                          # still inside the 30 s window
+    finish(db, winner, spin, index=14)                     # Custom Prefix x5
+    page = client.get("/admin").text
+    assert "Custom Prefix</td>" in page and ">5<" in page
+    assert "Nothing owed right now." not in page
+
+
+def test_free_spins_are_never_an_obligation_before_or_after_apply(db, client, monkeypatch):
+    clock = Clock(main.utcnow())
+    monkeypatch.setattr(main, "utcnow", clock)
+    admin = mkuser(db, CC, bits=10**9)
+    winner = mkuser(db, "winner", bits=10**9)
+    a, _c, _ = main.start_spin(db, winner, 1)
+    finish(db, winner, a, index=15)                        # 2 More Spins
+    clock.tick(120)
+    login(client, admin.id)
+    assert "Prize obligations" in client.get("/admin").text
+    assert "2 More Spins" not in client.get("/admin/prizes.csv").text
+    client.post("/admin/apply")
+    b, _c, _ = main.start_spin(db, winner, 1)
+    finish(db, winner, b, index=15)
+    assert "2 More Spins" not in client.get("/admin/prizes.csv").text
 
 
 def test_deltas_csv_uses_sheet_column(db, client):
