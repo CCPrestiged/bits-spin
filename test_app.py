@@ -249,7 +249,7 @@ def test_moving_logo_is_multiplied_by_wager(db):
     assert spin.payout == 0
 
 
-def test_two_more_spins_is_never_multiplied(db):
+def test_two_more_spins_always_hands_over_two(db):
     user = mkuser(db, "sov", bits=10**10)
     for wager in (1, 3, 1000, 30_000):
         spin, _c, _ = main.start_spin(db, user, wager)
@@ -257,6 +257,12 @@ def test_two_more_spins_is_never_multiplied(db):
         spin, _ = finish(db, user, spin)
         assert spin.label == "2 More Spins"
         assert spin.prize_qty == 2, wager
+        assert spin.payout == 0
+        assert main.free_state(db, user)["wager"] == wager
+        # clear the queue between rounds so each round starts fresh
+        for grant in main.free_grants(db, user.id):
+            db.delete(grant)
+        db.commit()
 
 
 def test_logos_and_prefixes_do_multiply(db):
@@ -837,3 +843,134 @@ def test_balance_sentence_on_the_page(db, client, monkeypatch):
     page = client.get("/").text
     assert "Your remaining BITS shown above is your BITS Bank figure" in page
     assert '<b class="d-neg">minus 300</b>' in page
+
+
+# --------------------------------------------------------------------- free spins
+def win_free(db, user, wager=5):
+    spin, _c, _ = main.start_spin(db, user, wager)
+    force_index(db, spin, 15)                      # 2 More Spins
+    return finish(db, user, spin)
+
+
+def test_free_spins_are_credited_at_the_wager_that_won_them(db):
+    user = mkuser(db, "sov", bits=10**7)
+    spin, _ = win_free(db, user, 5)
+    assert spin.kind == "free" and spin.prize_qty == 2 and spin.payout == 0
+    fs = main.free_state(db, user)
+    assert fs["count"] == 2 and fs["wager"] == 5
+
+
+def test_free_spins_stack(db):
+    user = mkuser(db, "sov", bits=10**7)
+    win_free(db, user, 5)
+    win_free(db, user, 5)
+    assert main.free_state(db, user)["count"] == 4
+
+
+def test_free_spins_queue_by_age_when_wagers_differ(db):
+    user = mkuser(db, "sov", bits=10**9)
+    win_free(db, user, 5)
+    win_free(db, user, 50)
+    fs = main.free_state(db, user)
+    assert fs["queue"] == [{"wager": 5, "count": 2}, {"wager": 50, "count": 2}]
+    assert fs["total"] == 4 and fs["wager"] == 5
+    for _ in range(2):
+        spin, cost, _ = main.start_spin(db, user, 1, free=True)
+        assert cost == 0 and spin.wager == 5
+    spin, _c, _ = main.start_spin(db, user, 1, free=True)
+    assert spin.wager == 50                       # next in the queue
+    assert main.free_state(db, user)["count"] == 1
+
+
+def test_a_free_spin_costs_nothing_and_ignores_the_chosen_wager(db):
+    user = mkuser(db, "sov", bits=1_000_000)
+    win_free(db, user, 5)
+    before = main.available_bits(db, user)
+    spin, cost, after = main.start_spin(db, user, 50, free=True)
+    assert cost == 0 and after == before
+    assert spin.wager == 5 and spin.cost == 0
+    assert main.free_state(db, user)["count"] == 1
+
+
+def test_a_free_spin_pays_at_its_wager(db):
+    user = mkuser(db, "sov", bits=1_000_000)
+    win_free(db, user, 5)
+    base = main.available_bits(db, user)
+    spin, _c, _ = main.start_spin(db, user, 1, free=True)
+    force_index(db, spin, 11)                     # 1000 BITS
+    spin, _ = finish(db, user, spin)
+    assert spin.payout == 5_000                    # 1000 x the wager it was won at
+    assert main.available_bits(db, user) == base + 5_000
+
+
+def test_a_free_spin_can_win_more_free_spins(db):
+    user = mkuser(db, "sov", bits=1_000_000)
+    win_free(db, user, 5)                          # 2 at x5
+    spin, _c, _ = main.start_spin(db, user, 1, free=True)
+    force_index(db, spin, 15)                      # another 2 More Spins
+    finish(db, user, spin)
+    assert main.free_state(db, user)["count"] == 3  # one spent, two won back
+
+
+def test_no_free_spins_left_is_refused(db):
+    user = mkuser(db, "sov", bits=10**6)
+    with pytest.raises(main.Refused) as err:
+        main.start_spin(db, user, 1, free=True)
+    assert "no free spins" in str(err.value).lower()
+
+
+def test_abandoning_a_free_spin_burns_it(db):
+    user = mkuser(db, "sov", bits=1_000_000)
+    win_free(db, user, 5)
+    spin, _c, _ = main.start_spin(db, user, 1, free=True)
+    assert main.free_state(db, user)["count"] == 1
+    spin.expires_at = main.utcnow() - __import__("datetime").timedelta(seconds=1)
+    db.commit()
+    main.sweep(db)
+    assert db.get(main.Spin, spin.id).status == "forfeited"
+    assert main.free_state(db, user)["count"] == 1   # spent, not refunded
+
+
+def test_free_spins_survive_a_reload(db):
+    user = mkuser(db, "sov", bits=10**7)
+    win_free(db, user, 5)
+    db.expire_all()                                  # everything back from the database
+    reloaded = db.get(main.User, user.id)
+    assert main.free_state(db, reloaded)["count"] == 2
+
+
+def test_free_spins_are_not_a_prize_to_hand_out(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    player = mkuser(db, "spinner", bits=10**7)
+    win_free(db, player, 5)
+    login(client, admin.id)
+    assert "2 More Spins" not in client.get("/admin/prizes.csv").text
+    d = client.get("/admin/player/%d.json" % player.id).json()
+    assert d["free"]["count"] == 2 and d["free"]["wager"] == 5
+    assert d["spins"][0]["free"] is False and d["spins"][0]["kind"] == "free"
+
+
+def test_api_reports_free_spins(db, client, monkeypatch):
+    monkeypatch.setattr(main, "REVEAL_AFTER", 0)
+    user = mkuser(db, "sov", bits=10**7)
+    win_free(db, user, 5)
+    login(client, user.id)
+    assert client.get("/api/me").json()["free"]["count"] == 2
+    r = client.post("/api/spin", json={"free": True})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["cost"] == 0 and d["wager"] == 5 and d["free"] is True
+    assert d["free_spins"]["count"] == 1
+    client.post("/api/spin/%s/reveal" % d["spin_id"])
+    paid = client.post("/api/spin/%s/claim" % d["spin_id"]).json()
+    assert paid["free"] is True
+
+
+def test_page_offers_the_free_button_markup(db, client):
+    user = mkuser(db, "sov", bits=10**7)
+    win_free(db, user, 5)
+    login(client, user.id)
+    page = client.get("/").text
+    assert "SPIN!" in page and "id=costbtn" in page
+    assert "FREE SPIN" in page and "id=freebtn" in page
+    assert '"count": 2' in page and '"wager": 5' in page
