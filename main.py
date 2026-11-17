@@ -102,6 +102,7 @@ SPIN_TTL = int(env("BS_SPIN_TTL_SECONDS", "30"))
 # The wheel must actually turn before the result is revealed. Anything closed before this
 # many seconds is a forfeit, which is the whole point of the timer.
 REVEAL_AFTER = float(env("BS_REVEAL_SECONDS", "3.6"))
+FREE_SPIN_AWARD = 2                    # "2 More Spins" hands over exactly two
 MAX_WAGER = int(env("BS_MAX_WAGER", "1000000000"))
 WAGER_MIN_RANK = env("BS_WAGER_MIN_RANK", "Sovereign")
 
@@ -138,9 +139,9 @@ WHEEL = [
      "kind": "prize", "weight": 1, "color": "#ffb74d", "scales": True},
     {"label": "Custom Prefix", "emoji": "\U0001F9EC", "code": "1f9ec", "amount": 1,
      "kind": "prize", "weight": 1, "color": "#ba68c8", "scales": True},
-    # two extra spins is two extra spins: it never multiplies, whatever the wager
+    # two free spins, credited at the wager that won them; never multiplied
     {"label": "2 More Spins", "emoji": "\U0001F504", "code": "1f504", "amount": 2,
-     "kind": "prize", "weight": 1, "color": "#90caf9", "scales": False},
+     "kind": "free", "weight": 1, "color": "#90caf9", "scales": False},
 ]
 
 LEGACY_LADDER = ["Organiser", "Herald", "Sentinel", "Enforcer", "Sovereign", "Configurator",
@@ -228,6 +229,17 @@ class Spin(Base):
     settled_at = Column(DateTime(timezone=True))
 
 
+class FreeSpin(Base):
+    """Free spins are a credit, not a prize to hand out: `remaining` spins at `wager`,
+    queued in the order they were won, and they stay put until they are used."""
+    __tablename__ = "free_spins"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    wager = Column(Integer)
+    remaining = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
 class Meta(Base):
     __tablename__ = "meta"
     k = Column(String(48), primary_key=True)
@@ -257,6 +269,33 @@ def delta_for(db, user_id, after_id=0) -> int:
 
 def available_bits(db, user) -> int:
     return int(user.bank_bits or 0) + delta_for(db, user.id, user.applied_through or 0)
+
+
+def free_grants(db, user_id):
+    """Oldest grant first."""
+    return db.execute(select(FreeSpin)
+                      .where(FreeSpin.user_id == user_id, FreeSpin.remaining > 0)
+                      .order_by(FreeSpin.created_at, FreeSpin.id)).scalars().all()
+
+
+def free_state(db, user):
+    grants = free_grants(db, user.id)
+    if not grants:
+        return None
+    head = grants[0]
+    return {"count": head.remaining, "wager": head.wager,
+            "total": sum(g.remaining for g in grants),
+            "queue": [{"wager": g.wager, "count": g.remaining} for g in grants]}
+
+
+def grant_free_spins(db, user_id, wager, count=2):
+    row = db.execute(select(FreeSpin)
+                     .where(FreeSpin.user_id == user_id, FreeSpin.wager == wager)
+                     .order_by(FreeSpin.created_at)).scalars().first()
+    if row:
+        row.remaining += count
+    else:
+        db.add(FreeSpin(user_id=user_id, wager=wager, remaining=count))
 
 
 def meta_get(db, key, default=""):
@@ -314,33 +353,45 @@ def sweep(db, now=None) -> int:
     return n
 
 
-def start_spin(db, user, wager):
+def start_spin(db, user, wager, free=False):
     sweep(db)
     capped = False
-    multiple = can_wager_multiple(user.bank_rank)
-    try:
-        wager = int(wager)
-    except (TypeError, ValueError):
-        raise Refused("Pick a whole number wager.")
-    if not multiple:
-        wager, capped = 1, True          # below Sovereign: 300 BITS, no multiple
-    if wager < 1 or wager > MAX_WAGER:
-        raise Refused("Wager must be between 1 and %s." % f"{MAX_WAGER:,}")
+    if free:
+        grants = free_grants(db, user.id)
+        if not grants:
+            raise Refused("You have no free spins left.")
+        grant = grants[0]
+        wager, cost = grant.wager, 0     # the wager it was won at, and it costs nothing
+        grant.remaining -= 1
+        if grant.remaining <= 0:
+            db.delete(grant)
+        balance = available_bits(db, user)
+    else:
+        multiple = can_wager_multiple(user.bank_rank)
+        try:
+            wager = int(wager)
+        except (TypeError, ValueError):
+            raise Refused("Pick a whole number wager.")
+        if not multiple:
+            wager, capped = 1, True          # below Sovereign: 300 BITS, no multiple
+        if wager < 1 or wager > MAX_WAGER:
+            raise Refused("Wager must be between 1 and %s." % f"{MAX_WAGER:,}")
 
-    cost = SPIN_COST * wager
-    balance = available_bits(db, user)
-    if cost > balance:
-        if balance <= 0:
-            raise Refused("You have no BITS yet, so there is nothing to spin with. "
-                          "How BITS work: " + BITS_HELP)
-        raise Refused("That costs %s BITS; you have %s." % (f"{cost:,}", f"{balance:,}"))
+        cost = SPIN_COST * wager
+        balance = available_bits(db, user)
+        if cost > balance:
+            if balance <= 0:
+                raise Refused("You have no BITS yet, so there is nothing to spin with. "
+                              "How BITS work: " + BITS_HELP)
+            raise Refused("That costs %s BITS; you have %s." % (f"{cost:,}", f"{balance:,}"))
 
     seed = secrets.token_hex(32)
     spin = Spin(id=str(uuid.uuid4()), user_id=user.id, wager=wager, capped=capped, cost=cost,
                 status="pending", commit=commit_of(seed), seed=seed,
                 created_at=utcnow(), expires_at=utcnow() + dt.timedelta(seconds=SPIN_TTL))
     db.add(spin)
-    db.add(Ledger(user_id=user.id, spin_id=spin.id, delta=-cost, reason="spin"))
+    if cost:
+        db.add(Ledger(user_id=user.id, spin_id=spin.id, delta=-cost, reason="spin"))
     db.commit()
     return spin, cost, balance - cost
 
@@ -368,11 +419,12 @@ def reveal_spin(db, user, spin_id, now=None):
         spin.index_landed, spin.label, spin.kind = index, slice_["label"], slice_["kind"]
         if slice_["kind"] == "bits":
             spin.payout = slice_["amount"] * spin.wager
+        elif slice_["kind"] == "free":
+            spin.payout, spin.prize_qty = 0, 0      # the free spins land at claim
         else:
-            # a wager multiplies logos and prefixes, but never extra spins
+            # a wager multiplies logos and prefixes
             spin.payout = 0
-            spin.prize_qty = (slice_["amount"] * spin.wager if slice_["scales"]
-                              else slice_["amount"])
+            spin.prize_qty = slice_["amount"] * spin.wager if slice_["scales"] else slice_["amount"]
         spin.status = "revealed"
         db.commit()
     return spin
@@ -393,6 +445,9 @@ def claim_spin(db, user, spin_id, now=None):
         raise Refused("The wheel has not stopped yet.")
     if spin.payout:
         db.add(Ledger(user_id=user.id, spin_id=spin.id, delta=spin.payout, reason="payout"))
+    if spin.kind == "free":
+        grant_free_spins(db, user.id, spin.wager, FREE_SPIN_AWARD)
+        spin.prize_qty = FREE_SPIN_AWARD            # what the claim actually handed over
     spin.status = "settled"
     spin.settled_at = now
     db.commit()
@@ -657,6 +712,13 @@ th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
 th{color:var(--muted);font-weight:600;font-size:.74rem;text-transform:uppercase;letter-spacing:.1em}
 .mono{font-variant-numeric:tabular-nums}
 .d-pos{color:#4ade80}.d-neg{color:#f87171}
+.btnrow{display:flex;gap:12px;flex-wrap:wrap;align-items:stretch}
+.bigbtn{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;
+gap:2px;padding:11px 26px;border-radius:14px;min-width:158px}
+.bigbtn b{font-size:1.22rem;letter-spacing:.05em;line-height:1.15}
+.bigbtn span{font-size:.8rem;font-weight:600;opacity:.88}
+.bigbtn.free{background:linear-gradient(180deg,#7ee0a8,#38a967);color:#06220f;border:0}
+.bigbtn.free span{opacity:.75}
 .hint{color:var(--muted);font-size:.86rem}
 .note{border:1px solid rgba(242,193,78,.38);background:rgba(242,193,78,.07);
 border-radius:14px;padding:14px 18px;margin:0 0 18px;font-size:.92rem;line-height:1.5}
@@ -671,6 +733,7 @@ footer{margin-top:32px;color:var(--muted);font-size:.8rem;text-align:center}
 # a small dark pointer at the top and a soft shadow under the disc.
 WHEEL_JS = r"""
 const SLICES = %(slices)s, COST = %(cost)d, TTL = %(ttl)d, MULTI = %(multi)s;
+const FREE0 = %(free)s;
 const SEG = SLICES.length, SIZE = 560, STEP = 2 * Math.PI / SEG;
 const cv = document.getElementById('wheel'), ctx = cv.getContext('2d');
 const DPR = Math.min(2, window.devicePixelRatio || 1);
@@ -795,9 +858,34 @@ function show(msg, bad) {
 function busy(on) {
   spinning = on;
   document.getElementById('go').disabled = on;
+  document.getElementById('gofree').disabled = on;
   document.querySelectorAll('.wager button').forEach(b => { b.disabled = on || !MULTI; });
   document.getElementById('wager').disabled = on || !MULTI;
   drawWheel();
+}
+
+/* the free-spin button: how many are left, and at which wager */
+function applyFree(fs) {
+  const btn = document.getElementById('gofree'), label = document.getElementById('freebtn');
+  const hint = document.getElementById('freehint');
+  if (!fs || !fs.count) { btn.hidden = true; btn.disabled = true; hint.hidden = true; return; }
+  btn.hidden = false;
+  btn.disabled = spinning;
+  hint.hidden = false;
+  const head = fs.queue[0];
+  let txt = '×' + head.count + ' left at wager ×' + head.wager.toLocaleString();
+  const rest = fs.queue.slice(1);
+  if (rest.length) {
+    txt += ' · then ' + rest.map(q =>
+      '×' + q.count + ' at ×' + q.wager.toLocaleString()).join(', ');
+  }
+  label.textContent = txt;
+}
+
+function setCost(w) {
+  const txt = 'for ' + (COST * w).toLocaleString() + ' BITS';
+  document.getElementById('costbtn').textContent = txt;
+  document.getElementById('cost').textContent = (COST * w).toLocaleString();
 }
 
 function emojiFor(label) {
@@ -839,13 +927,13 @@ async function collect() {
   throw new Error(last);
 }
 
-async function spin() {
+async function spin(useFree) {
   if (spinning) return;
   show('');
   document.getElementById('result').textContent = '';
   const res = await fetch('/api/spin', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({wager: wager})
+    body: JSON.stringify(useFree ? {free: true} : {wager: wager})
   });
   const j = await res.json();
   if (!res.ok) { show(j.detail || 'Refused', true); return; }
@@ -854,6 +942,7 @@ async function spin() {
   }
   spinId = j.spin_id;
   document.getElementById('balance').textContent = j.balance.toLocaleString();
+  applyFree(j.free_spins);
   document.getElementById('commit').textContent = 'committed before you paid: ' + j.commit.slice(0, 16) + '…';
   busy(true);
 
@@ -915,13 +1004,21 @@ async function spin() {
   }
 
   const em = emojiFor(paid.label);
-  document.getElementById('result').textContent = paid.kind === 'prize'
-    ? em + ' ' + paid.label + ' \u00d7 ' + paid.prize_qty.toLocaleString()
-    : em + ' ' + paid.label + '  \u2192  +' + paid.paid.toLocaleString() + ' BITS';
+  const extra = paid.free_spins && paid.free_spins.count
+    ? '  \u2014 you have ' + paid.free_spins.count + ' free spin' +
+      (paid.free_spins.count === 1 ? '' : 's') + ' at \u00d7' + paid.free_spins.wager.toLocaleString()
+    : '';
+  document.getElementById('result').textContent = paid.kind === 'free'
+    ? em + ' ' + paid.label + '  \u2192  +' + paid.prize_qty.toLocaleString() + ' free spins'
+    : (paid.kind === 'prize'
+        ? em + ' ' + paid.label + ' \u00d7 ' + paid.prize_qty.toLocaleString()
+        : em + ' ' + paid.label + '  \u2192  +' + paid.paid.toLocaleString() + ' BITS');
+  if (paid.kind === 'free') document.getElementById('result').textContent += extra;
   document.getElementById('balance').textContent = paid.balance.toLocaleString();
   document.getElementById('commit').textContent =
     'wager x' + paid.wager + ' \u00b7 seed ' + paid.seed.slice(0, 12) + '\u2026 \u00b7 sha256 ' +
     paid.commit.slice(0, 12) + '\u2026';
+  applyFree(paid.free_spins);
   busy(false);
   loadLog();
 }
@@ -931,7 +1028,7 @@ function pickWager(btn) {
   btn.classList.add('on');
   wager = +btn.dataset.w;
   document.getElementById('wager').value = wager;
-  document.getElementById('cost').textContent = (COST * wager).toLocaleString();
+  setCost(wager);
 }
 
 async function loadLog() {
@@ -948,19 +1045,21 @@ async function loadLog() {
       what = 'still turning\u2026';
     }
     return '<tr><td class="mono">' + new Date(s.created_at).toLocaleString() + '</td>' +
-      '<td class="mono">x' + s.wager + '</td><td>' + what + '</td>' +
-      '<td class="mono">-' + s.cost.toLocaleString() + '</td></tr>';
+      '<td class="mono">x' + s.wager + (s.free ? ' free' : '') + '</td><td>' + what + '</td>' +
+      '<td class="mono">' + (s.cost ? '-' + s.cost.toLocaleString() : 'free') + '</td></tr>';
   }).join('') || '<tr><td colspan="4" class="hint">No spins yet.</td></tr>';
 }
 
-document.getElementById('go').onclick = spin;
-cv.onclick = spin;
+document.getElementById('go').onclick = function(){ spin(false); };
+document.getElementById('gofree').onclick = function(){ spin(true); };
+cv.onclick = function(){ spin(false); };
 cv.style.cursor = 'pointer';
 document.querySelectorAll('.wager button').forEach(b => { b.onclick = () => pickWager(b); });
 document.getElementById('wager').oninput = e => {
   wager = Math.max(1, parseInt(e.target.value || '1', 10));
-  document.getElementById('cost').textContent = (COST * wager).toLocaleString();
+  setCost(wager);
 };
+applyFree(FREE0);
 if (COST !== 300) {
   const note = document.getElementById('costnote');
   if (note) {
@@ -968,6 +1067,7 @@ if (COST !== 300) {
       '<b id="cost">' + COST + '</b> BITS.';
   }
 }
+setCost(wager);
 drawWheel();
 loadLog();
 """
@@ -1050,7 +1150,8 @@ def index_page(user, state, slices_json):
                 'is not in the BITS Bank yet, say so in the team chat and it gets added.'
                 % (SPIN_COST, esc(BITS_HELP)))
     js = WHEEL_JS % {"slices": slices_json, "ttl": SPIN_TTL, "cost": SPIN_COST,
-                     "multi": "true" if multi else "false"}
+                     "multi": "true" if multi else "false",
+                     "free": json.dumps(state.get("free"))}
     return page("""
 <header class=top><div class=brand>Real Humans · <b>Mystery BITS</b></div>
 <div class=spacer></div><span class=pill>@%s</span>%s
@@ -1070,7 +1171,12 @@ def index_page(user, state, slices_json):
     BITS.</p>
     <div id=result class=result></div>
     <div id=err class=err style="display:none"></div>
-    <p><button id=go class=primary style="padding:12px 26px">Spin</button></p>
+    <div class=btnrow>
+      <button id=go class="bigbtn primary"><b>SPIN!</b><span id=costbtn>for 300 BITS</span></button>
+      <button id=gofree class="bigbtn free" hidden><b>FREE SPIN</b><span id=freebtn></span></button>
+    </div>
+    <p class=hint id=freehint hidden>A free spin costs nothing, keeps the wager it was won at, and
+    waits until you use it. Winning more of them adds to the pile.</p>
     <div class=hint id=commit></div>
     <p class=hint>If you reload or close the page before the wheel stops, the spin is lost — the
     wager and anything it landed on. The server enforces that, not this page.</p>
@@ -1150,7 +1256,8 @@ PLAYER_MODAL = """
       ['Left early', money(s.forfeited)], ['Staked', money(s.staked)],
       ['Paid back', money(s.won)], ['Net', money(s.won - s.staked)],
       ['Biggest win', money(s.best)]
-    ].map(function(p){ return '<div><span>' + p[0] + '</span><b>' + p[1] + '</b></div>'; }).join('');
+    ].concat(d.free ? [['Free spins', d.free.total + ' at x' + d.free.wager]] : [])
+    .map(function(p){ return '<div><span>' + p[0] + '</span><b>' + p[1] + '</b></div>'; }).join('');
     document.getElementById('pmBody').innerHTML = d.spins.map(function(x){
       var what = x.status === 'settled'
         ? (x.emoji + ' ' + x.label + (x.kind === 'prize' ? ' &times; ' + money(x.prize_qty) : ''))
@@ -1160,8 +1267,10 @@ PLAYER_MODAL = """
         : '&mdash;';
       return '<tr><td class=mono>' + new Date(x.when).toLocaleString() + '</td>' +
         '<td class=mono>x' + x.wager + '</td><td>' + esc(what) + '</td>' +
-        '<td' + (x.status === 'forfeited' ? ' class=pm-bad' : '') + '>' + esc(x.status) + '</td>' +
-        '<td class=mono>-' + money(x.cost) + '</td><td class=mono>' + paid + '</td></tr>';
+        '<td' + (x.status === 'forfeited' ? ' class=pm-bad' : '') + '>' +
+          esc(x.status) + (x.free ? ' \u00b7 free' : '') + '</td>' +
+        '<td class=mono>' + (x.cost ? '-' + money(x.cost) : 'free') + '</td>' +
+        '<td class=mono>' + paid + '</td></tr>';
     }).join('') || '<tr><td colspan=6 class=hint>No spins yet.</td></tr>';
     pm.classList.add('on');
   }
@@ -1247,7 +1356,8 @@ def state_of(db, user):
     return {"bank": int(user.bank_bits or 0), "delta": delta,
             "available": int(user.bank_bits or 0) + delta,
             "multiple": can_wager_multiple(user.bank_rank),
-            "rank": user.bank_rank or "", "rank_name": rank_of(user.bank_rank)}
+            "rank": user.bank_rank or "", "rank_name": rank_of(user.bank_rank),
+            "free": free_state(db, user)}
 
 
 def login_cookie(resp, user):
@@ -1380,7 +1490,8 @@ def api_me(request: Request, db=Depends(get_db)):
         return JSONResponse({"detail": "not signed in"}, status_code=401)
     s = state_of(db, user)
     s.update({"display": user.display, "cost_per_wager": SPIN_COST, "ttl": SPIN_TTL,
-              "reveal_after": REVEAL_AFTER, "is_admin": is_admin(user)})
+              "reveal_after": REVEAL_AFTER, "free_spins": free_state(db, user),
+              "is_admin": is_admin(user)})
     return s
 
 
@@ -1395,12 +1506,14 @@ async def api_spin(request: Request, db=Depends(get_db)):
         body = {}
     if not isinstance(body, dict):
         body = {}
+    use_free = bool(body.get("free"))
     try:
-        spin, cost, balance = start_spin(db, user, body.get("wager"))
+        spin, cost, balance = start_spin(db, user, body.get("wager"), free=use_free)
     except Refused as exc:
         return JSONResponse({"detail": exc.message}, status_code=400)
     return {"spin_id": spin.id, "cost": cost, "balance": balance, "commit": spin.commit,
             "wager": spin.wager, "capped": spin.capped, "ttl": SPIN_TTL,
+            "free": use_free, "free_spins": free_state(db, user),
             "reveal_after": REVEAL_AFTER, "expires_at": spin.expires_at.isoformat()}
 
 
@@ -1434,6 +1547,7 @@ def api_claim(spin_id: str, request: Request, db=Depends(get_db)):
     return {"paid": spin.payout, "prize_qty": spin.prize_qty, "label": spin.label,
             "kind": spin.kind, "index": spin.index_landed, "wager": spin.wager,
             "balance": state_of(db, user)["available"], "replayed": not fresh,
+            "free": spin.cost == 0, "free_spins": free_state(db, user),
             "seed": spin.seed, "commit": spin.commit, "status": spin.status}
 
 
@@ -1448,7 +1562,7 @@ def api_spins(request: Request, db=Depends(get_db)):
     return [{"id": s.id, "created_at": s.created_at.isoformat(), "wager": s.wager,
              "cost": s.cost, "status": s.status, "label": s.label or "",
              "kind": s.kind or "", "payout": s.payout or 0,
-             "prize_qty": s.prize_qty or 0} for s in rows]
+             "prize_qty": s.prize_qty or 0, "free": s.cost == 0} for s in rows]
 
 
 # --- admin
@@ -1482,7 +1596,7 @@ def admin_rows(db):
 def prize_rows(db):
     q = (select(User.display, User.lichess_id, Spin.label, func.sum(Spin.prize_qty))
          .join(User, Spin.user_id == User.id)
-         .where(Spin.prize_qty > 0, Spin.status == "settled")
+         .where(Spin.prize_qty > 0, Spin.status == "settled", Spin.kind != "free")
          .group_by(User.id, Spin.label).order_by(func.sum(Spin.prize_qty).desc()))
     return [{"display": d or l, "label": lab, "qty": int(qty)} for d, l, lab, qty in db.execute(q)]
 
@@ -1575,13 +1689,14 @@ def admin_player_json(uid: int, request: Request, db=Depends(get_db)):
         "in_bank": bank_row(db, user.lichess_id) is not None,
         "bank": int(user.bank_bits or 0),
         "delta": delta_for(db, uid, user.applied_through or 0),
+        "free": free_state(db, user),
         "summary": {"spins": int(total or 0), "collected": int(collected or 0),
                     "staked": int(staked or 0), "won": int(won or 0),
                     "forfeited": int(forfeited or 0), "best": int(best or 0)},
         "spins": [{"when": x.created_at.isoformat(), "wager": x.wager, "cost": x.cost,
                    "label": x.label or "", "emoji": emoji_of(x.label), "kind": x.kind or "",
                    "payout": x.payout or 0, "prize_qty": x.prize_qty or 0,
-                   "status": x.status} for x in spins],
+                   "free": x.cost == 0, "status": x.status} for x in spins],
     }
 
 
@@ -1613,12 +1728,13 @@ def admin_spins(request: Request, db=Depends(get_db)):
         return Response("forbidden", status_code=403)
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["when", "username", "wager", "capped", "cost", "status", "landed", "kind",
-                "bits_paid", "prize_owed", "seed", "commit"])
+    w.writerow(["when", "username", "wager", "capped", "cost", "free_spin", "status", "landed",
+                "kind", "bits_paid", "prize_owed", "seed", "commit"])
     q = select(Spin, User).join(User, Spin.user_id == User.id).order_by(Spin.created_at)
     for spin, user in db.execute(q).all():
         w.writerow([spin.created_at.isoformat(), "@" + (user.lichess_id or ""), spin.wager,
-                    "yes" if spin.capped else "", spin.cost, spin.status, spin.label or "",
+                    "yes" if spin.capped else "", spin.cost,
+                    "yes" if spin.cost == 0 else "", spin.status, spin.label or "",
                     spin.kind or "", spin.payout or 0, spin.prize_qty or 0,
                     spin.seed or "", spin.commit or ""])
     return PlainTextResponse(buf.getvalue(), media_type="text/csv",
