@@ -146,8 +146,8 @@ def test_wheel_one_is_the_original_sixteen_slices():
 WHEEL_2_ODDS = {
     "Bust - 100 BITS": 45.00, "600 BITS": 15.00, "1,500 BITS": 15.00, "3,000 BITS": 10.00,
     "6,000 BITS": 6.00, "15,000 BITS": 4.00, "60,000 BITS": 0.45, "150,000 BITS": 0.05,
-    "5 More Spins": 0.50, "x2 BITS fragment": 2.20, "x3 BITS fragment": 1.00,
-    "x5 BITS fragment": 0.60, "x10 BITS fragment": 0.20,
+    "5 More Spins": 0.50, "Fragment of x2 BITS Booster": 2.20, "Fragment of x3 BITS Booster": 1.00,
+    "Fragment of x5 BITS Booster": 0.60, "Fragment of x10 BITS Booster": 0.20,
 }
 
 WHEEL_3_ODDS = {
@@ -597,7 +597,7 @@ def test_a_wager_multiplies_fragments(db):
     user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
-    spin, cost, _ = spin_at(db, user, 2, index_of(2, "x2 BITS fragment"), wager=10)
+    spin, cost, _ = spin_at(db, user, 2, index_of(2, "Fragment of x2 BITS Booster"), wager=10)
     assert spin.prize_qty == 10
     # ten fragments is three Boosters and one fragment towards the next
     assert main.award_totals(db, user.id)[user.id]["bits_x2"] == 3
@@ -852,7 +852,7 @@ def test_one_fragment_is_not_a_booster_yet(db):
     user = mkuser(db, "u", bits=10 ** 9)
     user.test_unlocked = True
     db.commit()
-    spin, _, _ = spin_at(db, user, 2, index_of(2, "x5 BITS fragment"))
+    spin, _, _ = spin_at(db, user, 2, index_of(2, "Fragment of x5 BITS Booster"))
     assert spin.note == "1/3"
     assert main.fragments_of(db, user.id) == {"frag_x5": 1}
     assert main.award_totals(db, user.id) == {}
@@ -863,7 +863,7 @@ def test_three_fragments_become_one_booster(db):
     user.test_unlocked = True
     db.commit()
     for _ in range(3):
-        spin, _, _ = spin_at(db, user, 2, index_of(2, "x2 BITS fragment"))
+        spin, _, _ = spin_at(db, user, 2, index_of(2, "Fragment of x2 BITS Booster"))
     assert spin.note == "+1 booster"
     assert main.fragments_of(db, user.id) == {}
     assert main.award_totals(db, user.id)[user.id]["bits_x2"] == 1
@@ -874,7 +874,7 @@ def test_fragments_keep_the_change_when_two_boosters_come_out(db):
     user.test_unlocked = True
     db.commit()
     for _ in range(7):
-        spin_at(db, user, 2, index_of(2, "x3 BITS fragment"))
+        spin_at(db, user, 2, index_of(2, "Fragment of x3 BITS Booster"))
     assert main.fragments_of(db, user.id) == {"frag_x3": 1}
     assert main.award_totals(db, user.id)[user.id]["bits_x3"] == 2
 
@@ -883,7 +883,7 @@ def test_fragment_types_do_not_mix(db):
     user = mkuser(db, "u", bits=10 ** 9)
     user.test_unlocked = True
     db.commit()
-    for label in ("x2 BITS fragment", "x2 BITS fragment", "x10 BITS fragment"):
+    for label in ("Fragment of x2 BITS Booster", "Fragment of x2 BITS Booster", "Fragment of x10 BITS Booster"):
         spin_at(db, user, 2, index_of(2, label))
     assert main.fragments_of(db, user.id) == {"frag_x2": 2, "frag_x10": 1}
     assert main.award_totals(db, user.id) == {}
@@ -894,7 +894,7 @@ def test_the_booster_made_from_fragments_is_a_real_obligation(db):
     user.test_unlocked = True
     db.commit()
     for _ in range(3):
-        spin_at(db, user, 2, index_of(2, "x10 BITS fragment"))
+        spin_at(db, user, 2, index_of(2, "Fragment of x10 BITS Booster"))
     rows = main.prize_rows(db)
     assert [(r["key"], r["qty"]) for r in rows] == [("bits_x10", 1)]
     assert rows[0]["name"] == "x10 BITS Booster"
@@ -906,8 +906,8 @@ def test_mark_applied_clears_assets_but_never_fragments(db):
     user.test_unlocked = True
     db.commit()
     for _ in range(3):
-        spin_at(db, user, 2, index_of(2, "x2 BITS fragment"))     # 1 booster, 0 left
-    spin_at(db, user, 2, index_of(2, "x5 BITS fragment"))         # 1 fragment left
+        spin_at(db, user, 2, index_of(2, "Fragment of x2 BITS Booster"))     # 1 booster, 0 left
+    spin_at(db, user, 2, index_of(2, "Fragment of x5 BITS Booster"))         # 1 fragment left
     assert main.fragments_of(db, user.id) == {"frag_x5": 1}
     assert main.prize_rows(db)
 
@@ -1027,7 +1027,7 @@ def test_the_player_page_shows_three_tabs(db, client):
     html = r.text
     assert "id=tabs" in html
     assert "id=progBar" in html
-    assert "How these wheels work" in html
+    assert "How this wheel works" in html
     assert "Progressive Legacy Jackpot" in html
     assert '"numeral":"II"' in html or '"numeral": "II"' in html
 
@@ -1234,7 +1234,7 @@ def test_the_popup_shows_fragments_assets_and_progress(db, client):
     user = mkuser(db, "u", bits=10 ** 9)
     user.test_unlocked = True
     db.commit()
-    spin_at(db, user, 2, index_of(2, "x2 BITS fragment"))
+    spin_at(db, user, 2, index_of(2, "Fragment of x2 BITS Booster"))
     spin_at(db, user, 3, index_of(3, "x3 Legacy Booster"))
     login(client, admin.id)
     d = client.get("/admin/player/%d.json" % user.id).json()
@@ -1381,7 +1381,7 @@ def test_deltas_csv_leaves_fragments_out(db, client):
     user = mkuser(db, "u", bits=10 ** 9)
     user.test_unlocked = True
     db.commit()
-    spin_at(db, user, 2, index_of(2, "x2 BITS fragment"))
+    spin_at(db, user, 2, index_of(2, "Fragment of x2 BITS Booster"))
     login(client, admin.id)
     text = client.get("/admin/deltas.csv").text
     row = [l for l in text.splitlines() if l.startswith("@u,")][0].split(",")
@@ -1474,3 +1474,55 @@ def test_an_old_database_keeps_its_rows(db):
 def test_the_admin_meets_the_emoji_fallback(client):
     r = client.get("/emoji-sheet.png")
     assert r.status_code == 200 and r.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+# ===================================================================== the page itself
+def test_the_chances_are_not_struck_through(db, client):
+    """The rows fell back to bare <s> when the card was renamed and every percentage came out
+    crossed out. <s> carries a strikethrough of its own, so the rule has to reach it."""
+    css = main.CSS
+    assert ".oddsbox li .pct{" in css                # a plain span, not <s>
+    assert ".odds li" not in css                     # the old prefix matches nothing now
+    assert ".oddsbox ol{list-style:none" in css      # and the list itself is still styled
+    assert "'</b><span class=pct>'" in main.WHEEL_JS  # <s> carries a strikethrough of its own
+
+
+def test_the_fragment_slices_say_what_they_become():
+    labels = [s["label"] for s in main.WHEEL_2 if s["key"] and s["key"].startswith("frag_")]
+    assert labels == ["Fragment of x2 BITS Booster", "Fragment of x3 BITS Booster",
+                      "Fragment of x5 BITS Booster", "Fragment of x10 BITS Booster"]
+    for s in main.WHEEL_2:
+        if s["key"] and s["key"].startswith("frag_"):
+            assert len(s["lines"]) == 2                 # still two short lines on the wheel
+
+
+def test_the_explainer_keeps_later_wheels_to_themselves(db, client):
+    """Wheel I must not mention the jackpot or the fragments, Wheel II must not mention the
+    jackpot, and each section says which wheels it belongs to."""
+    user = mkuser(db, "u")
+    login(client, user.id)
+    html = client.get("/").text
+    how = html[html.index('id=howBox'):]
+    how = how[:how.index("</details>")]
+    jackpot = how[how.index("<h4>The Progressive Legacy Jackpot</h4>") - 40:]
+    assert 'data-ow="3"' in jackpot[:40]                 # Wheel III only
+    frags = how[how.index("<h4>Fragments</h4>") - 40:]
+    assert 'data-ow="2"' in frags[:40]                   # Wheel II only
+    boost = how[how.index("<h4>Boosters</h4>") - 40:]
+    assert 'data-ow="3"' in boost[:40]                   # Wheel III only
+    assert how.count("data-ow=") >= 8                    # every section is tagged
+    assert "renderHow" in html                           # and the page filters on the tab
+
+
+def test_the_wheel_one_section_never_names_a_fragment(db, client):
+    user = mkuser(db, "u")
+    login(client, user.id)
+    html = client.get("/").text
+    how = html[html.index('id=howBox'):]
+    how = how[:how.index("</details>")]
+    for chunk in how.split("<section"):
+        head = chunk[:40]
+        if 'data-ow="1"' in head:                        # the section shown on Wheel I
+            body = chunk
+            assert "jackpot" not in body.lower()
+            assert "fragment" not in body.lower()
