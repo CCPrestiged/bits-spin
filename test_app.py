@@ -528,39 +528,31 @@ def test_the_third_bar_counts_wheel_three_spins_not_bits(db):
     assert main.progress_for(db, user, 3)["have"] == 2
 
 
-def test_mark_applied_starts_every_bar_again(db):
+def test_mark_applied_leaves_every_bar_alone(db, client):
+    """Only the deltas and the prize obligations are cleared. The bars count lifetime spins:
+    a bar that went backwards would tell a player their spins had been taken away."""
+    admin = mkuser(db, CC, bits=10 ** 12, admin=True)
     user = mkuser(db, "u", bits=10 ** 12)
     _spin_n(db, user, 1, 100)                    # Wheel II is now open
-    assert main.progress_for(db, user, 1)["have"] == 100
-
-    # a stamp well after those spins: finish() settles them a few seconds ahead of the clock
-    stamp = main.utcnow() + dt.timedelta(seconds=30)
-    main.meta_set(db, "prizes_applied_at", stamp.isoformat())
-    for u in db.query(main.User).all():
-        u.progress_reset_at = stamp
-    db.commit()
+    login(client, admin.id)
+    client.post("/admin/apply")
+    db.expire_all()
 
     bar = main.progress_for(db, user, 1)
-    assert bar["have"] == 0                     # the bar starts from nothing
-    assert bar["open"] is True                  # but the wheel stays open
+    assert bar["have"] == 100                    # exactly what it was
+    assert bar["open"] is True
     assert 2 in main.unlocked_wheels(db, user)
-    assert main.cycle_counts(db, user) == {1: 0, 2: 0, 3: 0}
-    assert main.wheel_counts(db, user.id)[1] == 100           # history is untouched
+    assert not hasattr(main.User, "progress_reset_at")
 
 
-def test_the_bar_counts_from_the_reset_but_not_before_it(db, monkeypatch):
+def test_the_bar_counts_every_finished_spin_it_ever_had(db):
     user = mkuser(db, "u", bits=10 ** 12)
-    clock = Clock(main.utcnow())
-    monkeypatch.setattr(main, "utcnow", clock)
     _spin_n(db, user, 1, 3)
-    clock.tick(60)
-    user.progress_reset_at = main.utcnow()
-    db.commit()
-    assert main.progress_for(db, user, 1)["have"] == 0
-    clock.tick(1)
+    assert main.progress_for(db, user, 1)["have"] == 3
     _spin_n(db, user, 1, 2)
-    assert main.progress_for(db, user, 1)["have"] == 2        # the new ones count again
-    assert main.wheel_counts(db, user.id)[1] == 5             # and the history is all there
+    assert main.progress_for(db, user, 1)["have"] == 5        # nothing takes them back
+    assert main.wheel_counts(db, user.id)[1] == 5
+    assert main.progress_for(db, user, 2)["have"] == 0        # each bar counts its own wheel
 
 
 # ===================================================================== payouts
@@ -1076,18 +1068,22 @@ def test_the_bits_sentence_is_plain(db):
 
 def test_the_model_knows_every_column_the_migration_adds(db):
     """A column added by ALTER but missing from the model is written nowhere and read as
-    None. That is how progress_reset_at slipped through the first time."""
+    None. That is how the last one slipped through the first time."""
     for table, column, _kind in main.COLUMN_ADDITIONS:
         assert column in main.Base.metadata.tables[table].columns, (table, column)
 
 
-def test_mark_applied_really_writes_the_bar_reset(db, client):
+def test_mark_applied_still_clears_the_deltas(db, client):
     admin = mkuser(db, CC, bits=10 ** 9, admin=True)
     user = mkuser(db, "u", bits=10 ** 9)
+    db.add(main.Ledger(user_id=user.id, delta=500, reason="test"))
+    db.commit()
     login(client, admin.id)
     client.post("/admin/apply")
     db.expire_all()
-    assert db.get(main.User, user.id).progress_reset_at is not None
+    row = db.get(main.User, user.id)
+    assert row.applied_through >= 1               # the ledger is behind us now
+    assert main.player_payload(db, user)["delta"] == 0
 
 
 def test_one_bad_column_does_not_stop_the_others(db, monkeypatch):
@@ -1452,8 +1448,8 @@ def test_a_boolean_default_is_spelled_the_same_everywhere(dialect):
 @pytest.mark.parametrize("dialect,stamp", [
     ("sqlite", "TIMESTAMP"), ("postgresql", "TIMESTAMP WITH TIME ZONE")])
 def test_the_timestamp_type_follows_the_database(dialect, stamp):
-    ddl = main.column_ddl("users", "progress_reset_at", "stamp", dialect)
-    assert ddl == "ALTER TABLE users ADD COLUMN progress_reset_at " + stamp
+    ddl = main.column_ddl("users", "last_seen", "stamp", dialect)
+    assert ddl == "ALTER TABLE users ADD COLUMN last_seen " + stamp
 
 
 def test_every_addition_is_a_plain_add_column():
