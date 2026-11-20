@@ -1477,6 +1477,27 @@ def test_the_admin_meets_the_emoji_fallback(client):
 
 
 # ===================================================================== the page itself
+def test_the_chances_page_does_not_talk_the_wheel_down(db, client):
+    """A note giving the expected return as a percentage of the price reads as a warning and
+    stops people spinning. The odds themselves stay; that sentence goes."""
+    user = mkuser(db, "u")
+    login(client, user.id)
+    html = client.get("/").text
+    assert "oddsFoot" not in html and "oddsFoot" not in main.WHEEL_JS
+    for phrase in ("of the price", "hands back about", "great many spins"):
+        assert phrase not in main.WHEEL_JS
+
+
+def test_every_section_of_the_explainer_has_one_heading():
+    """Two h4s in a row happened once; nothing catches that by looking at the page."""
+    import re as _re
+    how = main.HOW
+    for chunk in how.split("<section")[1:]:
+        heads = _re.findall(r"<h4>", chunk)
+        assert len(heads) <= 1, chunk[:120]
+    assert how.count("<h4>What the bar counts</h4>") == 1
+
+
 def test_the_chances_are_not_struck_through(db, client):
     """The rows fell back to bare <s> when the card was renamed and every percentage came out
     crossed out. <s> carries a strikethrough of its own, so the rule has to reach it."""
