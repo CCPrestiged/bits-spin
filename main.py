@@ -19,14 +19,21 @@ Rules this file implements
 --------------------------
 * spending BITS      = J - P * 1,000,000     (per row of the BITS Bank sheet)
 * a spin costs       = the wheel's price * wager
-* wager in multiples = Sovereign and above only; below that the wager is forced
-                       to 1 and they simply pay the price for whatever they win
+* wager in multiples = Wheel I asks for Sovereign, Wheel II for Administrator.
+                       Below that the wager is forced to 1 and they simply pay
+                       the price for whatever they win
 * BITS prizes scale  = a wager of 30 landing on 1,500 BITS owes 45,000
-* items never scale  = logos, prefixes, fragments, boosters and tokens are
-                       things, not money, so a wager leaves them alone
+* items scale too    = a wager of 10 on a fragment is ten fragments, which is
+                       three Boosters and one over. Free spins are the one
+                       exception: the count stays fixed, but each free spin keeps
+                       the wager it was won at, so the wager is already inside it
 * fragments          = 3 of the same fragment make one Booster, automatically.
                        Fragments are kept forever; boosters are owed to the
                        player and cleared by Mark applied.
+* the three bars     = finished spins between two Mark applied. That button
+                       starts them again from zero; a wheel that is open stays
+                       open. The last bar counts Wheel III spins and says nothing
+                       about what is behind it.
 * jackpot            = every paid Wheel III spin drops its whole price into one
                        pot. The pot is paid out the moment somebody lands on the
                        jackpot, and then starts again from zero.
@@ -125,12 +132,16 @@ ACTIVE_SECONDS = int(env("BS_ACTIVE_SECONDS", "150"))   # a page that pinged thi
 PING_EVERY = int(env("BS_PING_SECONDS", "45"))          # how often the page says it is still there
 FREE_SPIN_AWARD = 2                    # Wheel I's "2 More Spins" hands over exactly two
 MAX_WAGER = int(env("BS_MAX_WAGER", "1000000"))         # hard ceiling on any wager
-WAGER_MIN_RANK = env("BS_WAGER_MIN_RANK", "Sovereign")
+# Who may wager, per wheel. Wheel I takes a Sovereign; Wheel II asks for Administrator,
+# because a x10 there is 30,000 BITS a spin and it is meant to be the step up.
+WAGER_MIN_RANK = {1: env("BS_WAGER_MIN_RANK", "Sovereign"),
+                  2: env("BS_WAGER_MIN_RANK_II", "Administrator")}
 
 # Wheel II opens at 100 finished Wheel I spins, Wheel III at 1000 finished Wheel II spins.
 UNLOCK_SPINS = {2: 100, 3: 1000}
 UNLOCK_FROM = {2: 1, 3: 2}
-# The far end of Wheel III's bar. Whatever is behind it is not written down anywhere.
+# The far end of Wheel III's bar, counted in Wheel III spins. Whatever is behind it is not
+# written down anywhere.
 SECRET_TARGET = 10_000
 
 # --------------------------------------------------------------------------- the wheels
@@ -266,6 +277,19 @@ WHEELS = {
         "mood": "Nothing about this wheel is steady."},
 }
 
+# A wager multiplies what a wheel hands over, not only the money: a x10 on a fragment is
+# ten fragments, which is three Boosters and a fragment towards the next one. Fragments are
+# rare enough that a big wager should feel like it bought something.
+#
+# Free spins are the one exception, and it is not an oversight: the count stays fixed, but
+# every free spin keeps the wager it was won at, so the wager is already inside their value.
+# Multiplying the count as well would apply it twice, and five free spins at x10 are 98,000
+# BITS of expectation as it is.
+for _wheel in (WHEEL_1, WHEEL_2, WHEEL_3):
+    for _slice in _wheel:
+        if _slice["kind"] == "item":
+            _slice["scales"] = True
+
 WHEEL = WHEEL_1                    # the old name for Wheel I, still used in a few places
 
 # Every item a slice can hand over. The keys are also the CSV column names.
@@ -362,8 +386,13 @@ def rank_ordinal(rank_name, title_name="") -> int:
     return (r + 1) * 100 + (t + 1)
 
 
-def can_wager_multiple(rank_name) -> bool:
-    return rank_index(rank_name) >= rank_index(WAGER_MIN_RANK)
+def wager_from(wheel=1) -> str:
+    """The rung a wheel asks for before it will take a multiple."""
+    return WAGER_MIN_RANK.get(int(wheel), WAGER_MIN_RANK[1])
+
+
+def can_wager_multiple(rank_name, wheel=1) -> bool:
+    return rank_index(rank_name) >= rank_index(wager_from(wheel))
 
 
 def utcnow():
@@ -390,6 +419,7 @@ class User(Base):
     applied_through = Column(Integer, default=0)
     last_seen = Column(DateTime(timezone=True))     # last time this player had the page open
     test_unlocked = Column(Boolean, default=False)  # admin switch: every wheel open at once
+    progress_reset_at = Column(DateTime(timezone=True))   # the three bars count from here
 
 
 class Ledger(Base):
@@ -702,24 +732,45 @@ def unlocked_wheels(db, user, counts=None) -> set:
     return have
 
 
-def secret_progress(db, user_id) -> int:
-    """BITS won on Wheel III towards the thing at the end of the bar."""
-    return int(db.execute(select(func.coalesce(func.sum(Spin.payout), 0))
-                          .where(Spin.user_id == user_id, Spin.wheel == 3,
-                                 Spin.status == "settled")).scalar() or 0)
+def cycle_counts(db, user) -> dict:
+    """Finished spins since the last Mark applied.
+
+    That button starts every bar again from zero, so the bars measure the stretch between
+    two bank updates rather than all of history. What a bar opens is a different question,
+    and `unlocked_wheels` answers that one from the lifetime counts.
+    """
+    since = _aware(user.progress_reset_at) if getattr(user, "progress_reset_at", None) else None
+    if since is None:
+        return wheel_counts(db, user.id)
+    rows = db.execute(select(Spin.wheel, func.count(Spin.id))
+                      .where(Spin.user_id == user.id, Spin.status == "settled",
+                             Spin.settled_at > since)
+                      .group_by(Spin.wheel)).all()
+    out = {1: 0, 2: 0, 3: 0}
+    for wheel, count in rows:
+        out[int(wheel or 1)] = out.get(int(wheel or 1), 0) + int(count or 0)
+    return out
 
 
-def progress_for(db, user, wheel, counts=None):
-    """The glowing bar under the wheel: what it is counting, and how far along it is."""
-    counts = counts if counts is not None else wheel_counts(db, user.id)
-    if int(wheel) == 1:
-        return {"have": counts.get(1, 0), "need": UNLOCK_SPINS[2], "unit": "spins",
-                "target": "Wheel II", "secret": False}
-    if int(wheel) == 2:
-        return {"have": counts.get(2, 0), "need": UNLOCK_SPINS[3], "unit": "spins",
-                "target": "Wheel III", "secret": False}
-    return {"have": secret_progress(db, user.id), "need": SECRET_TARGET,
-            "unit": "BITS won here", "target": "???", "secret": True}
+def progress_for(db, user, wheel, counts=None, cycle=None, have=None):
+    """The glowing bar under the wheel: what it counts, and how far along it is.
+
+    `open` says whether the wheel it points at is already open, which matters after a reset:
+    the bar goes back to nothing but the door stays open.
+    """
+    cycle = cycle if cycle is not None else cycle_counts(db, user)
+    have = have if have is not None else unlocked_wheels(db, user, counts)
+    wheel = int(wheel)
+    if wheel == 1:
+        return {"have": cycle.get(1, 0), "need": UNLOCK_SPINS[2], "unit": "spins",
+                "target": "Wheel II", "secret": False, "open": 2 in have,
+                "opens": "Wheel II"}
+    if wheel == 2:
+        return {"have": cycle.get(2, 0), "need": UNLOCK_SPINS[3], "unit": "spins",
+                "target": "Wheel III", "secret": False, "open": 3 in have,
+                "opens": "Wheel III"}
+    return {"have": cycle.get(3, 0), "need": SECRET_TARGET, "unit": "spins",
+            "target": "???", "secret": True, "open": False, "opens": ""}
 
 
 # --------------------------------------------------------------------------- the spin
@@ -783,9 +834,9 @@ def start_spin(db, user, wager, free=False, wheel=1):
         if not spec["wager"]:
             wager = 1                     # Wheel III has no wager at all
         else:
-            multiple = can_wager_multiple(user.bank_rank)
+            multiple = can_wager_multiple(user.bank_rank, wheel)
             if not multiple:
-                wager, capped = 1, True   # below Sovereign: one price, no multiple
+                wager, capped = 1, True   # below the wheel's rung: one price, no multiple
             max_wager = wheel_max_wager(wheel)
             if wager < 1 or wager > max_wager:
                 raise Refused("The wager on Wheel %s runs from 1 to %s."
@@ -921,32 +972,64 @@ def _key_for_label(label):
     return ""
 
 # --------------------------------------------------------------------------- upgrades
-def ensure_columns():
+# The columns this version needs that the first version did not have. `kind` says how the
+# column is spelled, because SQLite and PostgreSQL do not agree on all of it: a boolean
+# default is FALSE on PostgreSQL and 0 on SQLite, and "BOOLEAN DEFAULT 0" is rejected
+# outright by PostgreSQL. That one line is what stopped the first deploy.
+COLUMN_ADDITIONS = [
+    ("users", "last_seen", "stamp"),
+    ("users", "test_unlocked", "bool"),
+    ("users", "progress_reset_at", "stamp"),
+    ("spins", "wheel", "wheel_number"),
+    ("spins", "note", "short_text"),
+    ("free_spins", "wheel", "wheel_number"),
+]
+
+
+def column_ddl(table, column, kind, dialect="sqlite") -> str:
+    stamp = "TIMESTAMP" if dialect == "sqlite" else "TIMESTAMP WITH TIME ZONE"
+    types = {"stamp": stamp,
+             "bool": "BOOLEAN DEFAULT FALSE" if dialect == "sqlite" else "BOOLEAN DEFAULT FALSE",
+             "wheel_number": "INTEGER DEFAULT 1",
+             "short_text": "VARCHAR(48) DEFAULT ''"}
+    return "ALTER TABLE %s ADD COLUMN %s %s" % (table, column, types[kind])
+
+
+def ensure_columns(strict=False):
     """Add the columns this version needs to a database that was created before them.
 
     A site like this is deployed once and then kept, so the tables are patched in place
-    rather than dropped and rebuilt. Everything here is additive and runs once.
+    rather than dropped and rebuilt. Each column is tried on its own: one failure must not
+    stop the rest, which is exactly what happened on the first PostgreSQL deploy.
     """
-    stamp = "TIMESTAMP WITH TIME ZONE" if engine.dialect.name != "sqlite" else "TIMESTAMP"
-    wanted = [
-        ("users", "last_seen", stamp),
-        ("users", "test_unlocked", "BOOLEAN DEFAULT 0"),
-        ("spins", "wheel", "INTEGER DEFAULT 1"),
-        ("spins", "note", "VARCHAR(48) DEFAULT ''"),
-        ("free_spins", "wheel", "INTEGER DEFAULT 1"),
-    ]
+    dialect = engine.dialect.name
+    problems = []
     try:
-        have = {}
-        for table, column, ddl in wanted:
-            if table not in have:
-                have[table] = {c["name"] for c in inspect(engine).get_columns(table)}
-            if column in have[table]:
-                continue
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, ddl)))
-            have[table].add(column)
-    except Exception:                                            # noqa: BLE001
+        have = {t: {c["name"] for c in inspect(engine).get_columns(t)}
+                for t in {row[0] for row in COLUMN_ADDITIONS}}
+    except Exception as exc:                                     # noqa: BLE001
+        if strict:
+            raise RuntimeError("could not read the table layout: %s" % exc) from exc
         return
+    for table, column, kind in COLUMN_ADDITIONS:
+        if column in have.get(table, set()):
+            continue
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(column_ddl(table, column, kind, dialect)))
+        except Exception as exc:                                 # noqa: BLE001
+            problems.append("%s.%s: %s" % (table, column, exc))
+    missing = [w for w in COLUMN_ADDITIONS
+               if w[1] not in {c["name"] for c in inspect(engine).get_columns(w[0])}]
+    if missing:
+        message = "the database is missing columns: %s%s" % (
+            ", ".join("%s.%s" % (t, c) for t, c, _ in missing),
+            (" (" + "; ".join(problems) + ")") if problems else "")
+        print("MIGRATION FAILED:", message)
+        if strict:
+            raise RuntimeError(message)
+        return False
+    return True
 
 
 def backfill_awards(db):
@@ -1560,24 +1643,33 @@ function renderTabs() {
 }
 
 function renderProgress() {
-  const w = W[active], p = w.progress;
-  const pct = Math.max(0, Math.min(100, p.need ? (p.have / p.need) * 100 : 0));
-  const done = p.have >= p.need;
-  document.getElementById('progLab').textContent = p.secret
-    ? 'The end of this bar is not written down anywhere'
-    : ('Progress to Wheel ' + (active === 1 ? 'II' : 'III'));
-  document.getElementById('progVal').innerHTML = p.secret
-    ? (money(p.have) + ' / ' + money(p.need) + ' BITS won here')
-    : (money(p.have) + ' / ' + money(p.need) + ' spins' + (done ? ' \u2014 open' : ''));
+  const p = W[active].progress;
+  const open = !!p.open;
+  const pct = open ? 100 : Math.max(0, Math.min(100, p.need ? (p.have / p.need) * 100 : 0));
+  const lab = document.getElementById('progLab');
+  const val = document.getElementById('progVal');
+  const note = document.getElementById('progNote');
+  if (p.secret) {
+    lab.textContent = 'The end of this bar is not written down anywhere';
+    val.textContent = money(p.have) + ' / ' + money(p.need) + ' spins on Wheel III';
+    note.textContent = p.have >= p.need
+      ? 'Somebody has reached the end. That is all that is known.'
+      : 'Nobody who has reached it has said what waits there. A title, and something else.';
+  } else if (open) {
+    lab.textContent = p.opens + ' is open';
+    val.textContent = money(p.have) + ' spins since the last update';
+    note.textContent = 'The bar counts finished spins since the admin last updated the bank. ' +
+      'This wheel stays open whatever the bar says.';
+  } else {
+    lab.textContent = 'Progress to ' + p.opens;
+    val.textContent = money(p.have) + ' / ' + money(p.need) + ' spins';
+    note.textContent = p.have >= p.need
+      ? 'You can spin this wheel.'
+      : 'Spins you left before the wheel stopped do not count towards this.';
+  }
   const bar = document.getElementById('progBar');
   bar.style.width = pct.toFixed(2) + '%';
   bar.parentNode.setAttribute('aria-valuenow', Math.round(pct));
-  document.getElementById('progNote').textContent = p.secret
-    ? (done ? 'Somebody has reached the end. That is all that is known.'
-            : 'Nobody who has reached it has said what waits there. It is a special title, ' +
-              'and something else.')
-    : (done ? 'You can spin this wheel.' :
-       'Spins you left before the wheel stopped do not count towards this.');
 }
 
 function renderOdds() {
@@ -1617,9 +1709,10 @@ function renderHud() {
   if (!w.wager) {
     wagBox.innerHTML = '<div class="hint">No wager here. Every spin is ' + money(w.cost) +
       ' BITS, and the whole price goes into the jackpot.</div>';
-  } else if (!DATA.multi) {
-    wagBox.innerHTML = '<div class="hint">Below Sovereign the wager is fixed at one, so a ' +
-      'spin is ' + money(w.cost) + ' BITS.</div>';
+  } else if (!w.multi) {
+    wagBox.innerHTML = '<div class="hint">Wheel ' + w.numeral + ' takes a wager from ' +
+      w.wagerFrom + ' and above. Below that the wager is fixed at one, so a spin is ' +
+      money(w.cost) + ' BITS.</div>';
   } else {
     const steps = w.id === 1 ? [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000]
                              : [1, 2, 3, 5, 10];
@@ -1775,8 +1868,9 @@ async function spin(useFree) {
   const j = await res.json();
   if (!res.ok) { show(j.detail || 'Refused', true); return; }
   if (j.capped) {
-    show('Below Sovereign the wager is fixed at one, so this spin cost ' + money(j.cost) +
-      ' BITS.', false);
+    show('A wager on Wheel ' + W[spinWheel].numeral + ' starts at ' +
+      W[spinWheel].wagerFrom + ', so this spin was fixed at one and cost ' +
+      money(j.cost) + ' BITS.', false);
   }
   spinId = j.spin_id; spinWheel = active;
   document.getElementById('balance').textContent = money(j.balance);
@@ -1969,10 +2063,19 @@ kept for good and are never cleared, so nothing is wasted if you stop at two. Wh
 finished boosters directly, including the x20 BITS Booster, which cannot be bought anywhere.</p>
 
 <h4>What a wager multiplies</h4>
-<p>On Wheel I and Wheel II the wager multiplies BITS prizes and the three logo prizes. It
-never multiplies fragments, boosters, tokens or free spins, because those are counted in
-things rather than in BITS. Free spins keep the wager they were won at and belong to the
-wheel that paid them out, so a Wheel II free spin is spent on Wheel II.</p>
+<p>The wager multiplies everything a wheel hands over: the BITS, the three logo prizes, the
+fragments, the boosters and the tokens. Ten times the wager on a fragment is ten fragments,
+which arrives as three Boosters and one fragment towards the next.</p>
+<p>Free spins are the exception, and it is deliberate. The count stays the same at any wager,
+but each free spin keeps the wager it was won at and pays its own result at that wager, so
+the wager is already inside what they are worth. They also belong to the wheel that paid them
+out, so a Wheel II free spin is spent on Wheel II and never on another wheel.</p>
+
+<h4>What the bar counts</h4>
+<p>Finished spins, not BITS, and only since the admin last updated the bank. Pressing that
+button starts every bar again from zero, so it measures the stretch between two updates. A
+wheel that has already opened stays open whatever the bar says afterwards. The last bar counts
+Wheel III spins and nothing else.</p>
 
 <h4>Checking a spin</h4>
 <p>Before you pay, the server commits to a secret seed and shows you its SHA-256. When the
@@ -2105,7 +2208,7 @@ def state_of(db, user):
     delta = delta_for(db, user.id, user.applied_through or 0)
     return {"bank": int(user.bank_bits or 0), "delta": delta,
             "available": int(user.bank_bits or 0) + delta,
-            "multiple": can_wager_multiple(user.bank_rank),
+            "multiple": can_wager_multiple(user.bank_rank, 1),
             "rank": user.bank_rank or "", "rank_name": rank_of(user.bank_rank),
             "free": free_state_all(db, user), "jackpot": jackpot_value(db)}
 
@@ -2355,11 +2458,13 @@ def admin_page(rows, prizes, meta):
   delta into column H of the sheet (that moves J, and J - P x 1e6 is the spending figure),
   hand out the prizes in the three logo columns and the eight asset columns after them, then
   <b>Sync bank</b> and <b>Mark applied</b>. Nothing is written for you. Mark applied sets both
-  lists back to zero: the Deltas file and the prize obligations below. It never clears a
-  fragment. Someone marked <i>not in bank</i> has no BITS, so they cannot spin yet.</p>
+  lists back to zero, the Deltas file and the prize obligations below, and starts the three
+  progress bars again from zero as well. It never clears a fragment, and a wheel that has
+  already opened stays open. Someone marked <i>not in bank</i> has no BITS, so they cannot
+  spin yet.</p>
   <form method=post action="/admin/sync" style="display:inline"><button class=primary>Sync bank</button></form>
   <form method=post action="/admin/apply" style="display:inline"
-    onsubmit="return confirm('Deltas typed into the sheet and prizes handed out? This clears both lists.')">
+    onsubmit="return confirm('Deltas typed into the sheet and prizes handed out? This clears both lists and the three bars.')">
     <button>Mark applied</button></form>
   <a class=btn href="/admin/deltas.csv">Deltas + prizes</a>
   <a class=btn href="/admin/spins.csv">Every spin</a>
@@ -2633,12 +2738,15 @@ def ensure_admin_flag(db, user):
 @app.on_event("startup")
 def _startup():
     Base.metadata.create_all(engine)
-    ensure_columns()
+    # If a column cannot be added there is no point serving: every page that reads a player
+    # would answer 500. Failing here puts the reason in the deploy log instead.
+    ensure_columns(strict=True)
     db = SessionLocal()
     try:
         backfill_awards(db)
     finally:
         db.close()
+    print("ready: three wheels, migration ok")
 
 
 def player_payload(db, user):
@@ -2646,7 +2754,9 @@ def player_payload(db, user):
     and never has to fetch a wheel it has not seen yet."""
     counts = wheel_counts(db, user.id)
     have = unlocked_wheels(db, user, counts)
+    cycle = cycle_counts(db, user)
     state = state_of(db, user)
+    rank = user.bank_rank
     wheels = []
     for w in (1, 2, 3):
         spec = WHEELS[w]
@@ -2655,7 +2765,8 @@ def player_payload(db, user):
             "id": w, "numeral": spec["numeral"], "name": spec["name"], "tag": spec["tag"],
             "mood": spec["mood"], "cost": spec["cost"], "maxWager": wheel_max_wager(w),
             "wager": bool(spec["wager"]), "unlocked": w in have,
-            "progress": progress_for(db, user, w, counts),
+            "multi": can_wager_multiple(rank, w), "wagerFrom": wager_from(w),
+            "progress": progress_for(db, user, w, counts, cycle, have),
             "average": {"per": round(avg["per_spin"], 2), "cost": avg["cost"],
                         "pct": round(avg["pct"], 1)},
             "slices": [{"label": s["label"], "lines": s["lines"], "emoji": s["emoji"],
@@ -2664,7 +2775,8 @@ def player_payload(db, user):
                         "pct": round(int(s["weight"]) / 100.0, 2)} for s in spec["slices"]],
             "free": free_state(db, user, w),
         })
-    return {"wheels": wheels, "active": 1, "multi": state["multiple"],
+    return {"wheels": wheels, "active": 1,
+            "multi": can_wager_multiple(rank, 1) or can_wager_multiple(rank, 2),
             "available": state["available"], "bank": state["bank"], "delta": state["delta"],
             "display": user.display or user.lichess_id, "jackpot": jackpot_value(db),
             "ping": PING_EVERY, "reveal": REVEAL_AFTER, "ttl": SPIN_TTL,
@@ -2924,6 +3036,7 @@ def admin_apply(request: Request, db=Depends(get_db)):
     for u in db.query(User).all():
         last = db.execute(select(func.max(Ledger.id)).where(Ledger.user_id == u.id)).scalar()
         u.applied_through = int(last or 0)
+        u.progress_reset_at = now          # the three bars start again from zero
     meta_set(db, "prizes_applied_at", now.isoformat())      # prize list starts empty again
     db.commit()
     return RedirectResponse("/admin", status_code=303)
