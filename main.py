@@ -211,13 +211,13 @@ WHEEL_2 = [
        amount=150000, scales=True),
     _s("5 More Spins", ["5 more", "spins"], "\U0001F504", "1f504", "free", 50, "#b6c1d6",
        amount=5),
-    _s("x2 BITS fragment", ["x2", "fragment"], "\u26A1", "26a1", "item", 220, "#9589c2",
+    _s("Fragment of x2 BITS Booster", ["Fragment", "of x2 BITS"], "\u26A1", "26a1", "item", 220, "#9589c2",
        amount=1, key="frag_x2"),
-    _s("x3 BITS fragment", ["x3", "fragment"], "\U0001F525", "1f525", "item", 100, "#a79ad6",
+    _s("Fragment of x3 BITS Booster", ["Fragment", "of x3 BITS"], "\U0001F525", "1f525", "item", 100, "#a79ad6",
        amount=1, key="frag_x3"),
-    _s("x5 BITS fragment", ["x5", "fragment"], "\U0001F680", "1f680", "item", 60, "#b9aee6",
+    _s("Fragment of x5 BITS Booster", ["Fragment", "of x5 BITS"], "\U0001F680", "1f680", "item", 60, "#b9aee6",
        amount=1, key="frag_x5"),
-    _s("x10 BITS fragment", ["x10", "fragment"], "\U0001F31F", "1f31f", "item", 20, "#cdc4f2",
+    _s("Fragment of x10 BITS Booster", ["Fragment", "of x10 BITS"], "\U0001F31F", "1f31f", "item", 20, "#cdc4f2",
        amount=1, key="frag_x10"),
 ]
 
@@ -1379,15 +1379,15 @@ transition:.2s}
 .oddsbox[open] summary .more::after{transform:rotate(180deg)}
 .oddsbox ol{list-style:none;margin:14px 0 0;padding:0;
 display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:0 26px}
-.odds li{display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:8px;align-items:center;
+.oddsbox li{display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:8px;align-items:center;
 padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.88rem}
-.odds li em{font-style:normal;width:24px;text-align:center;font-size:1rem}
-.odds li b{font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink)}
-.odds li s{text-decoration:none;color:var(--muted);font-variant-numeric:tabular-nums;
+.oddsbox li em{font-style:normal;width:24px;text-align:center;font-size:1rem}
+.oddsbox li b{font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink)}
+.oddsbox li .pct{color:var(--muted);font-variant-numeric:tabular-nums;
 font-size:.82rem}
-.odds li .tag{font-size:.66rem;color:var(--muted);border:1px solid var(--line);
+.oddsbox li .tag{font-size:.66rem;color:var(--muted);border:1px solid var(--line);
 border-radius:999px;padding:1px 6px;margin-left:6px;white-space:nowrap}
-.odds li.special b{color:var(--acc)}
+.oddsbox li.special b{color:var(--acc)}
 
 /* ---- the jackpot */
 .pot{display:grid;grid-template-columns:104px minmax(0,1fr);gap:14px;align-items:center;
@@ -1406,6 +1406,13 @@ details.how summary::before{content:'\\25B8  ';display:inline-block;transition:.
 details.how[open] summary::before{transform:rotate(90deg)}
 details.how div.hint{margin-top:8px;line-height:1.6}
 details.how h4{margin:12px 0 4px;font-size:.86rem;letter-spacing:.02em}
+details.how section+section h4{margin-top:16px}
+.how .w{color:#8cc9f0;font-weight:600}
+.how .m{color:#ffd08a;font-weight:600}
+.how .l{color:#8ce0b0;font-weight:600}
+.how .b{color:#c9b8f5;font-weight:600}
+.how .j{color:#f5a262;font-weight:600}
+.how .p{color:#9ae6b4;font-weight:600}
 details.how p{margin:0 0 6px;color:var(--muted);font-size:.85rem;line-height:1.6}
 
 /* ---- spin log */
@@ -1676,20 +1683,20 @@ function renderOdds() {
     const tip = s.kind === 'jackpot'
       ? 'Every paid spin on Wheel III drops its 30,000 BITS into one pot. Whoever lands here ' +
         'takes the whole pot, and it starts again from zero.'
-      : s.kind === 'item' && s.label.indexOf('fragment') >= 0
+      : s.kind === 'item' && s.label.toLowerCase().indexOf('fragment') >= 0
       ? 'Three fragments of the same kind become one Booster of that kind. Fragments are ' +
         'yours for good; the Booster is handed to you by the admin.'
       : s.label;
     return '<li class="' + (s.kind !== 'bits' ? 'special' : '') + '" title="' + tip + '">' +
-      '<em>' + s.emoji + '</em><b>' + s.label + tag + '</b><s>' +
-      s.pct.toFixed(2) + '%</s></li>';
+      '<em>' + s.emoji + '</em><b>' + s.label + tag + '</b><span class=pct>' +
+      s.pct.toFixed(2) + '%</span></li>';
   }).join('');
   const avg = w.average;
   document.getElementById('oddsFoot').textContent =
     'A spin costs ' + money(w.cost) + ' BITS' +
     (w.wager ? ' (or a multiple of it)' : '') + '. Over a great many spins the wheel hands ' +
     'back about ' + money(Math.round(avg.per)) + ' BITS a spin, which is ' + avg.pct +
-    '% of the price. Items, tokens and free spins are not BITS and are not counted in that.';
+    '% of the price. Anything that is not BITS is left out of that figure.';
 }
 
 function renderHud() {
@@ -1763,6 +1770,12 @@ function renderFree() {
   label.textContent = txt;
 }
 
+function renderHow() {
+  document.querySelectorAll('#howBox section[data-ow]').forEach(function (el) {
+    el.hidden = el.dataset.ow.split(',').indexOf(String(active)) < 0;
+  });
+}
+
 function renderPot() {
   const box = document.getElementById('potCard');
   if (active !== 3) { box.hidden = true; return; }
@@ -1801,7 +1814,7 @@ function chooseWheel(id) {
   show('');
   active = id;
   document.body.setAttribute('data-w', String(id));
-  renderTabs(); renderProgress(); renderHud(); renderOdds(); renderPot();
+  renderTabs(); renderProgress(); renderHud(); renderOdds(); renderPot(); renderHow();
   drawWheel();
 }
 
@@ -1844,7 +1857,7 @@ function refresh() {
         w.unlocked = fresh.unlocked; w.progress = fresh.progress; w.free = fresh.free;
       });
       DATA.jackpot = d.jackpot;
-      renderTabs(); renderProgress(); renderHud(); renderOdds(); renderPot();
+      renderTabs(); renderProgress(); renderHud(); renderOdds(); renderPot(); renderHow();
       return d;
     });
 }
@@ -1978,7 +1991,7 @@ document.getElementById('go').onclick = () => spin(false);
 document.getElementById('gofree').onclick = () => spin(true);
 cv.onclick = () => spin(false);
 cv.style.cursor = 'pointer';
-renderTabs(); renderProgress(); renderHud(); renderOdds(); renderPot();
+renderTabs(); renderProgress(); renderHud(); renderOdds(); renderPot(); renderHow();
 drawWheel();
 loadLog();
 
@@ -2028,53 +2041,90 @@ PIGGY = """
 </svg>"""
 
 HOW = """
-<details class=how><summary>How these wheels work</summary>
+<details class=how id=howBox><summary>How this wheel works</summary>
 <div class=hint>
+
+<section data-ow="1,2,3" hidden>
 <h4>Equal slices, unequal chances</h4>
-<p>The wheel is drawn with every slice the same size, because that is what a wheel looks like.
-The list above is the real chance of each slice, and those numbers do not match the sizes.
-Each wheel changes what a spin costs, what it can give and who may spin it.</p>
+<p>Every slice is drawn the same size, because that is what a wheel looks like. The list above
+holds the real chance of each slice, and those numbers have nothing to do with how wide a slice
+is. What is in front of you decides the price and the prizes; nothing is carried over from one
+wheel to another.</p>
+</section>
 
-<h4>Unlocking</h4>
-<p>Wheel I is open to everybody. Wheel II opens after 100 finished spins on Wheel I.
-Wheel III opens after 1,000 finished spins on Wheel II. The wager makes no difference, only
-the number of spins, and a spin only counts once it has been collected. If you close the page
-before the wheel stops, that spin is gone and it does not count.</p>
-<p>You can always go back to a lower wheel. The bar belongs to the wheel you are on and does
-not change when you switch tabs.</p>
+<section data-ow="1,2,3" hidden>
+<h4>Opening the next wheel</h4>
+<p><span class=w>Wheel I</span> is open to everybody. <span class=w>Wheel II</span> opens once
+<span class=m>100</span> spins on Wheel I have been finished, and <span class=w>Wheel III</span>
+once <span class=m>1,000</span> spins on Wheel II have been finished. Only the count matters,
+never the wager, and a spin counts only after it has been collected: close the page while the
+wheel is still turning and that spin is gone, <span class=p>uncounted</span>.</p>
+<p>You can always step back down to a lower wheel. The <span class=p>bar</span> belongs to the
+wheel it sits under and does not move when you switch tabs.</p>
+</section>
 
+<section data-ow="1" hidden>
+<h4>What the wager multiplies</h4>
+<p>The wager multiplies the <span class=m>BITS</span> a slice pays and the <span class=l>logo
+prizes</span>. Ten times the wager is ten times the figure printed on the slice.</p>
+</section>
+
+<section data-ow="2" hidden>
+<h4>What the wager multiplies</h4>
+<p>The wager multiplies everything a slice hands over: the <span class=m>BITS</span>, the
+<span class=l>logo prizes</span> and the <span class=b>fragments</span>. Ten times the wager on
+a fragment slice is ten fragments.</p>
+</section>
+
+<section data-ow="1,2" hidden>
+<p><span class=l>Free spins</span> are the exception, and it is deliberate. The count stays
+the same at any wager, but each free spin keeps the wager it was won at and pays at that wager,
+so the wager is already inside it. A free spin also belongs to the wheel that paid it out and
+is spent there, never on another wheel.</p>
+</section>
+
+<section data-ow="2" hidden>
+<h4>Fragments</h4>
+<p>Four slices here pay a <span class=b>fragment</span>: x2, x3, x5 and x10. Three fragments of
+the same kind quietly become one <span class=b>Booster</span> of that kind, which the admin
+hands over with the rest of what you have won. Fragments are <span class=m>yours for good</span>
+and are never taken back, so stopping at two wastes nothing.</p>
+</section>
+
+<section data-ow="3" hidden>
+<h4>Boosters</h4>
+<p>This wheel skips the fragments and pays <span class=b>finished Boosters</span>: x3, x5, x10
+and <span class=m>x20</span> BITS, and x3 and x5 Legacy. The <span class=m>x20 BITS Booster</span>
+is not sold anywhere and does not come from any other wheel.</p>
+</section>
+
+<section data-ow="3" hidden>
 <h4>The Progressive Legacy Jackpot</h4>
-<p>Every paid spin on Wheel III puts its whole price, 30,000 BITS, into one pot that all
-players share. It is not taken from you as a prize and not paid to you as a win; it goes in
-the pot. When somebody lands on the jackpot slice, that player is paid the whole pot and the
-pot starts again from zero. Free spins do not feed it. A spin left before the wheel stops
-keeps its 30,000 in the pot.</p>
+<p>Every paid spin here drops its whole price, <span class=j>30,000 BITS</span>, into one
+<span class=j>pot</span> that every player shares. It is not taken from you as a prize and not
+paid to you as a win: it goes into the pot. Whoever lands on the <span class=j>jackpot</span>
+slice is paid the whole pot, and the pot then starts again from zero. Free spins do not feed
+it. A spin left before the wheel stops keeps its <span class=j>30,000</span> in the pot.</p>
+</section>
 
-<h4>Fragments and boosters</h4>
-<p>Wheel II can give a fragment: x2, x3, x5 or x10. Three fragments of the same kind quietly
-become one Booster of that kind, and the admin hands the Booster to you. Your fragments are
-kept for good and are never cleared, so nothing is wasted if you stop at two. Wheel III gives
-finished boosters directly, including the x20 BITS Booster, which cannot be bought anywhere.</p>
-
-<h4>What a wager multiplies</h4>
-<p>The wager multiplies everything a wheel hands over: the BITS, the three logo prizes, the
-fragments, the boosters and the tokens. Ten times the wager on a fragment is ten fragments,
-which arrives as three Boosters and one fragment towards the next.</p>
-<p>Free spins are the exception, and it is deliberate. The count stays the same at any wager,
-but each free spin keeps the wager it was won at and pays its own result at that wager, so
-the wager is already inside what they are worth. They also belong to the wheel that paid them
-out, so a Wheel II free spin is spent on Wheel II and never on another wheel.</p>
+<section data-ow="1,2,3" hidden>
+<h4>What the bar counts</h4>
 
 <h4>What the bar counts</h4>
-<p>Finished spins, not BITS, and all of them: the bar under Wheel I counts your finished Wheel I
-spins, from your first one onwards. Nothing ever takes those back. A spin you leave before the
-wheel stops is the one thing that does not count. The last bar counts Wheel III spins and
-nothing else.</p>
+<p><span class=p>Finished spins</span>, not BITS, and all of them: the bar under Wheel I
+counts your finished Wheel I spins, from the first one onwards. Nothing ever takes those back.
+A spin you leave before the wheel stops is the one thing that does not count. The last bar
+counts Wheel III spins and nothing else.</p>
+</section>
 
+<section data-ow="1,2,3" hidden>
 <h4>Checking a spin</h4>
-<p>Before you pay, the server commits to a secret seed and shows you its SHA-256. When the
-wheel stops it shows the seed. The slice is the seed read as a number, taken modulo 10,000,
-and looked up in the weights. Anybody can recompute it.</p>
+<p>Before you pay, the server commits to a secret <span class=m>seed</span> and shows you its
+<span class=m>SHA-256</span>. When the wheel stops it shows the seed. The slice is the seed read
+as a number, taken modulo <span class=m>10,000</span>, and looked up in the weights. Anybody can
+recompute it afterwards.</p>
+</section>
+
 </div></details>"""
 
 
