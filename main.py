@@ -30,10 +30,10 @@ Rules this file implements
 * fragments          = 3 of the same fragment make one Booster, automatically.
                        Fragments are kept forever; boosters are owed to the
                        player and cleared by Mark applied.
-* the three bars     = finished spins between two Mark applied. That button
-                       starts them again from zero; a wheel that is open stays
-                       open. The last bar counts Wheel III spins and says nothing
-                       about what is behind it.
+* the three bars     = finished spins, all of them, on the wheel the bar belongs
+                       to. Nothing clears a bar; Mark applied only clears the deltas
+                       and the prize obligations. The last bar counts Wheel III
+                       spins and says nothing about what is behind it.
 * jackpot            = every paid Wheel III spin drops its whole price into one
                        pot. The pot is paid out the moment somebody lands on the
                        jackpot, and then starts again from zero.
@@ -419,7 +419,6 @@ class User(Base):
     applied_through = Column(Integer, default=0)
     last_seen = Column(DateTime(timezone=True))     # last time this player had the page open
     test_unlocked = Column(Boolean, default=False)  # admin switch: every wheel open at once
-    progress_reset_at = Column(DateTime(timezone=True))   # the three bars count from here
 
 
 class Ledger(Base):
@@ -732,44 +731,26 @@ def unlocked_wheels(db, user, counts=None) -> set:
     return have
 
 
-def cycle_counts(db, user) -> dict:
-    """Finished spins since the last Mark applied.
-
-    That button starts every bar again from zero, so the bars measure the stretch between
-    two bank updates rather than all of history. What a bar opens is a different question,
-    and `unlocked_wheels` answers that one from the lifetime counts.
-    """
-    since = _aware(user.progress_reset_at) if getattr(user, "progress_reset_at", None) else None
-    if since is None:
-        return wheel_counts(db, user.id)
-    rows = db.execute(select(Spin.wheel, func.count(Spin.id))
-                      .where(Spin.user_id == user.id, Spin.status == "settled",
-                             Spin.settled_at > since)
-                      .group_by(Spin.wheel)).all()
-    out = {1: 0, 2: 0, 3: 0}
-    for wheel, count in rows:
-        out[int(wheel or 1)] = out.get(int(wheel or 1), 0) + int(count or 0)
-    return out
-
-
-def progress_for(db, user, wheel, counts=None, cycle=None, have=None):
+def progress_for(db, user, wheel, counts=None, have=None):
     """The glowing bar under the wheel: what it counts, and how far along it is.
 
-    `open` says whether the wheel it points at is already open, which matters after a reset:
-    the bar goes back to nothing but the door stays open.
+    It counts every finished spin of its own wheel, all of them, forever. Two things never
+    clear it: leaving a spin before it stops (that one never finishes), and Mark applied,
+    which only clears the deltas and the prize obligations. A bar therefore also says
+    whether the wheel it points at has opened, and that never goes back either.
     """
-    cycle = cycle if cycle is not None else cycle_counts(db, user)
+    counts = counts if counts is not None else wheel_counts(db, user.id)
     have = have if have is not None else unlocked_wheels(db, user, counts)
     wheel = int(wheel)
     if wheel == 1:
-        return {"have": cycle.get(1, 0), "need": UNLOCK_SPINS[2], "unit": "spins",
+        return {"have": counts.get(1, 0), "need": UNLOCK_SPINS[2], "unit": "spins",
                 "target": "Wheel II", "secret": False, "open": 2 in have,
                 "opens": "Wheel II"}
     if wheel == 2:
-        return {"have": cycle.get(2, 0), "need": UNLOCK_SPINS[3], "unit": "spins",
+        return {"have": counts.get(2, 0), "need": UNLOCK_SPINS[3], "unit": "spins",
                 "target": "Wheel III", "secret": False, "open": 3 in have,
                 "opens": "Wheel III"}
-    return {"have": cycle.get(3, 0), "need": SECRET_TARGET, "unit": "spins",
+    return {"have": counts.get(3, 0), "need": SECRET_TARGET, "unit": "spins",
             "target": "???", "secret": True, "open": False, "opens": ""}
 
 
@@ -979,7 +960,6 @@ def _key_for_label(label):
 COLUMN_ADDITIONS = [
     ("users", "last_seen", "stamp"),
     ("users", "test_unlocked", "bool"),
-    ("users", "progress_reset_at", "stamp"),
     ("spins", "wheel", "wheel_number"),
     ("spins", "note", "short_text"),
     ("free_spins", "wheel", "wheel_number"),
@@ -1326,7 +1306,7 @@ body[data-w="2"] .primary{color:#100e1a}
 body[data-w="3"] .primary{color:#1a0a04}
 input{font:inherit;background:#0e131c;border:1px solid var(--line);color:var(--ink);
 border-radius:10px;padding:10px 12px;width:100%}
-canvas{display:block;margin:0 auto;max-width:100%}
+canvas{display:block;margin:0 auto;width:100%;height:auto;max-width:600px}
 table{width:100%;border-collapse:collapse;font-size:.9rem}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
 th{color:var(--muted);font-weight:600;font-size:.74rem;text-transform:uppercase;
@@ -1370,11 +1350,10 @@ animation:sheen 2.8s linear infinite}
 @keyframes sheen{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
 @media(prefers-reduced-motion:reduce){.pbar>i::after{animation:none}}
 
-/* ---- the stage */
-.stage{display:grid;grid-template-columns:310px minmax(0,1fr) 330px;gap:18px;align-items:start}
-@media(max-width:1080px){.stage{grid-template-columns:minmax(0,1fr) 330px}}
+/* ---- the stage: the controls on the left, the wheel takes the rest of the room */
+.stage{display:grid;grid-template-columns:320px minmax(0,1fr);gap:20px;align-items:start}
 @media(max-width:860px){.stage{grid-template-columns:1fr}}
-.wheelcard{text-align:center}
+.wheelcard{text-align:center;width:100%;max-width:660px;margin:0 auto}
 .balance{font-family:Georgia,serif;font-size:2.3rem;line-height:1.05;margin:6px 0 2px}
 .wagrow{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0 6px}
 .wagrow button{padding:7px 12px;font-weight:600;font-size:.86rem}
@@ -1388,9 +1367,18 @@ gap:2px;padding:11px 22px;border-radius:14px;min-width:150px}
 .result{min-height:54px;display:flex;align-items:center;justify-content:center;
 font-family:Georgia,serif;font-size:1.4rem;color:var(--acc);text-align:center;margin-top:6px}
 
-/* ---- the odds column */
-.odds{max-height:none}
-.odds ol{list-style:none;margin:10px 0 0;padding:0}
+/* ---- the chances: under the wheel, folded away until it is asked for */
+.oddsbox{margin-top:18px}
+.oddsbox summary{display:flex;align-items:baseline;gap:12px;cursor:pointer;list-style:none;
+padding:2px 0}
+.oddsbox summary::-webkit-details-marker{display:none}
+.oddsbox summary .lab{margin:0}
+.oddsbox summary .more{margin-left:auto;color:var(--acc);font-size:.84rem;white-space:nowrap}
+.oddsbox summary .more::after{content:'▾';display:inline-block;margin-left:6px;
+transition:.2s}
+.oddsbox[open] summary .more::after{transform:rotate(180deg)}
+.oddsbox ol{list-style:none;margin:14px 0 0;padding:0;
+display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:0 26px}
 .odds li{display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:8px;align-items:center;
 padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.88rem}
 .odds li em{font-style:normal;width:24px;text-align:center;font-size:1rem}
@@ -1491,10 +1479,13 @@ DATA.wheels.forEach(w => { W[w.id] = w; });
 let active = DATA.active || 1;
 const wagered = {1: 1, 2: 1, 3: 1};
 
+/* The wheel is drawn inside a 600 x 600 square and CSS scales it by width alone
+   (height:auto, and the canvas is square in its own pixels), so it stays a circle at any
+   column width. Pinning a height in pixels is what used to squash it into an oval. */
 const SIZE = 600, DPR = Math.min(2, window.devicePixelRatio || 1);
 const cv = document.getElementById('wheel'), ctx = cv.getContext('2d');
 cv.width = SIZE * DPR; cv.height = SIZE * DPR;
-cv.style.width = SIZE + 'px'; cv.style.height = SIZE + 'px';
+cv.style.width = ''; cv.style.height = '';
 ctx.scale(DPR, DPR);
 const C = SIZE / 2, R = C - 24, HUB = R * 0.19;
 
@@ -1657,20 +1648,23 @@ function renderProgress() {
       : 'Nobody who has reached it has said what waits there. A title, and something else.';
   } else if (open) {
     lab.textContent = p.opens + ' is open';
-    val.textContent = money(p.have) + ' spins since the last update';
-    note.textContent = 'The bar counts finished spins since the admin last updated the bank. ' +
-      'This wheel stays open whatever the bar says.';
+    val.textContent = money(p.have) + ' / ' + money(p.need) + ' spins';
+    note.textContent = 'You are through. The bar keeps counting every spin you finish here; ' +
+      'nothing takes it back.';
   } else {
     lab.textContent = 'Progress to ' + p.opens;
     val.textContent = money(p.have) + ' / ' + money(p.need) + ' spins';
-    note.textContent = p.have >= p.need
-      ? 'You can spin this wheel.'
-      : 'Spins you left before the wheel stopped do not count towards this.';
+    note.textContent = 'Every spin you finish on this wheel counts. A spin you leave before ' +
+      'the wheel stops does not.';
   }
   const bar = document.getElementById('progBar');
   bar.style.width = pct.toFixed(2) + '%';
   bar.parentNode.setAttribute('aria-valuenow', Math.round(pct));
 }
+
+document.getElementById('oddsBox').addEventListener('toggle', function () {
+  this.querySelector('.more').textContent = this.open ? 'hide' : 'show';
+});
 
 function renderOdds() {
   const w = W[active];
@@ -2072,10 +2066,10 @@ the wager is already inside what they are worth. They also belong to the wheel t
 out, so a Wheel II free spin is spent on Wheel II and never on another wheel.</p>
 
 <h4>What the bar counts</h4>
-<p>Finished spins, not BITS, and only since the admin last updated the bank. Pressing that
-button starts every bar again from zero, so it measures the stretch between two updates. A
-wheel that has already opened stays open whatever the bar says afterwards. The last bar counts
-Wheel III spins and nothing else.</p>
+<p>Finished spins, not BITS, and all of them: the bar under Wheel I counts your finished Wheel I
+spins, from your first one onwards. Nothing ever takes those back. A spin you leave before the
+wheel stops is the one thing that does not count. The last bar counts Wheel III spins and
+nothing else.</p>
 
 <h4>Checking a spin</h4>
 <p>Before you pay, the server commits to a secret seed and shows you its SHA-256. When the
@@ -2148,13 +2142,13 @@ def index_page(user, payload, delta):
       </div>
     </div>
   </div>
-  <div class="card odds">
-    <div class=lab id=oddsTitle></div>
-    <ol id=oddsList></ol>
-    <div class=hint id=oddsFoot style="margin-top:12px"></div>
-    %s
-  </div>
 </div>
+<details class="card oddsbox" id=oddsBox open>
+  <summary><span class=lab id=oddsTitle></span><span class=more>hide</span></summary>
+  <ol id=oddsList></ol>
+  <div class=hint id=oddsFoot style="margin-top:12px"></div>
+</details>
+<div class="card" style="margin-top:18px">%s</div>
 <div class=card style="margin-top:20px"><div class=lab>Your spins</div>
   <table id=log><thead><tr><th>When</th><th>Wheel</th><th>Wager</th><th>Landed</th>
   <th>Cost</th></tr></thead><tbody></tbody></table>
@@ -2458,13 +2452,12 @@ def admin_page(rows, prizes, meta):
   delta into column H of the sheet (that moves J, and J - P x 1e6 is the spending figure),
   hand out the prizes in the three logo columns and the eight asset columns after them, then
   <b>Sync bank</b> and <b>Mark applied</b>. Nothing is written for you. Mark applied sets both
-  lists back to zero, the Deltas file and the prize obligations below, and starts the three
-  progress bars again from zero as well. It never clears a fragment, and a wheel that has
-  already opened stays open. Someone marked <i>not in bank</i> has no BITS, so they cannot
-  spin yet.</p>
+  lists back to zero, the Deltas file and the prize obligations below. It clears nothing
+  else: not a fragment, not a spin record, not a progress bar. Someone marked <i>not in
+  bank</i> has no BITS, so they cannot spin yet.</p>
   <form method=post action="/admin/sync" style="display:inline"><button class=primary>Sync bank</button></form>
   <form method=post action="/admin/apply" style="display:inline"
-    onsubmit="return confirm('Deltas typed into the sheet and prizes handed out? This clears both lists and the three bars.')">
+    onsubmit="return confirm('Deltas typed into the sheet and prizes handed out? This clears both lists, the deltas and the prizes. Fragments and the progress bars are left alone.')">
     <button>Mark applied</button></form>
   <a class=btn href="/admin/deltas.csv">Deltas + prizes</a>
   <a class=btn href="/admin/spins.csv">Every spin</a>
@@ -2754,7 +2747,6 @@ def player_payload(db, user):
     and never has to fetch a wheel it has not seen yet."""
     counts = wheel_counts(db, user.id)
     have = unlocked_wheels(db, user, counts)
-    cycle = cycle_counts(db, user)
     state = state_of(db, user)
     rank = user.bank_rank
     wheels = []
@@ -2766,7 +2758,7 @@ def player_payload(db, user):
             "mood": spec["mood"], "cost": spec["cost"], "maxWager": wheel_max_wager(w),
             "wager": bool(spec["wager"]), "unlocked": w in have,
             "multi": can_wager_multiple(rank, w), "wagerFrom": wager_from(w),
-            "progress": progress_for(db, user, w, counts, cycle, have),
+            "progress": progress_for(db, user, w, counts=counts, have=have),
             "average": {"per": round(avg["per_spin"], 2), "cost": avg["cost"],
                         "pct": round(avg["pct"], 1)},
             "slices": [{"label": s["label"], "lines": s["lines"], "emoji": s["emoji"],
@@ -3035,8 +3027,7 @@ def admin_apply(request: Request, db=Depends(get_db)):
     now = utcnow()
     for u in db.query(User).all():
         last = db.execute(select(func.max(Ledger.id)).where(Ledger.user_id == u.id)).scalar()
-        u.applied_through = int(last or 0)
-        u.progress_reset_at = now          # the three bars start again from zero
+        u.applied_through = int(last or 0)   # the deltas, and nothing else on the user
     meta_set(db, "prizes_applied_at", now.isoformat())      # prize list starts empty again
     db.commit()
     return RedirectResponse("/admin", status_code=303)
