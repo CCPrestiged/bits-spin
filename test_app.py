@@ -401,7 +401,8 @@ def test_mark_applied_empties_the_prize_list(db, client, monkeypatch):
     assert "Nothing owed right now." in page
     assert client.get("/admin/prizes.csv").text.strip().splitlines() == ["username,prize,owed"]
     deltas = client.get("/admin/deltas.csv").text.strip().splitlines()
-    assert deltas[0].endswith("prizes_owed") and all("Logo" not in row for row in deltas[1:])
+    assert deltas[0].endswith("static_logos,moving_logos,custom_prefixes")
+    assert all(row.endswith(",0,0,0") for row in deltas[1:])
 
 
 def test_prizes_won_after_the_stamp_show_again(db, client, monkeypatch):
@@ -768,10 +769,10 @@ def test_deltas_csv_carries_the_prizes(db, client):
     text = client.get("/admin/deltas.csv").text
     head, row = text.splitlines()[0], text.splitlines()[1]
     assert head == ("username,rank,spending_before,delta_to_type_into_H,spending_after,"
-                    "spins,staked,prizes_owed")
+                    "spins,staked,static_logos,moving_logos,custom_prefixes")
     assert row.startswith("@winner,")
-    assert "Moving Logo x3" in row and "Static Logo x4" in row
-    assert row.count(";") == 1
+    cells = row.split(",")
+    assert cells[7:] == ["4", "3", "0"]              # H static, I moving, J prefixes
 
 
 def test_prize_csv_and_admin_table_keep_emoji_out_of_the_csv(db, client):
@@ -1061,3 +1062,114 @@ def test_page_offers_the_free_button_markup(db, client):
     assert "SPIN!" in page and "id=costbtn" in page
     assert "FREE SPIN" in page and "id=freebtn" in page
     assert '"count": 2' in page and '"wager": 5' in page
+
+# --------------------------------------------------------------------- the players table
+def row_of(page, uid):
+    """The admin table is one long line, so cut it back into rows first."""
+    for chunk in page.split("<tr class=prow"):
+        if 'data-uid="%d"' % uid in chunk:
+            return chunk.split("</tr>")[0]
+    return ""
+
+
+def test_players_table_headings_are_sortable(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    login(client, admin.id)
+    page = client.get("/admin").text
+    assert 'id=playersTbl' in page
+    for col, (label, kind) in enumerate(main.PLAYER_COLS):
+        assert 'class=sortable data-col="%d" data-type="%s"' % (col, kind) in page, label
+    assert page.count('class=arrow') == len(main.PLAYER_COLS)
+    assert "sortable" in main.PLAYER_MODAL and "data-v" in page
+
+
+def test_sort_keys_are_on_every_cell(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    player = mkuser(db, "someone", bits=1234, rank="Sentinel")
+    spin, _c, _ = main.start_spin(db, player, 2)
+    finish(db, player, spin, index=12)                    # Static Logo x2
+    login(client, admin.id)
+    page = client.get("/admin").text
+    row = row_of(page, player.id)
+    assert row.count("data-v=") == len(main.PLAYER_COLS)
+    assert 'data-v="1234"' in row                        # bank, unsorted-friendly number
+    assert row.index('data-v="1234"') > row.index('data-v="someone"')
+
+
+def test_last_spin_column_says_what_they_landed(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    quiet = mkuser(db, "quiet", bits=10**6)
+    player = mkuser(db, "spinner", bits=10**8)
+    spin, _c, _ = main.start_spin(db, player, 2)
+    finish(db, player, spin, index=12)                    # Static Logo
+    login(client, admin.id)
+    page = client.get("/admin").text
+    assert "<th class=sortable data-col=\"7\" data-type=\"time\"><button type=button>Last Spin" in page
+    assert "Static Logo" in row_of(page, player.id) and "just now" in row_of(page, player.id)
+    assert "never" in row_of(page, quiet.id)
+
+
+def test_who_is_on_the_page(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    here = mkuser(db, "here", bits=10**6)
+    away = mkuser(db, "away", bits=10**6)
+
+    login(client, here.id)
+    assert client.get("/").status_code == 200            # opening the page marks them present
+
+    login(client, admin.id)
+    live = client.get("/admin/live.json").json()
+    assert live["players"][str(here.id)]["active"] is True
+    assert live["players"][str(away.id)]["active"] is False
+    page = client.get("/admin").text
+    assert 'class="dot live"' in row_of(page, here.id)
+    away_row = row_of(page, away.id)
+    assert 'class="dot"' in away_row and "dot live" not in away_row
+    assert live["active_seconds"] == main.ACTIVE_SECONDS
+
+
+def test_live_json_is_admin_only(db, client):
+    player = mkuser(db, "someone", bits=10**6)
+    login(client, player.id)
+    assert client.get("/admin/live.json").status_code == 403
+
+
+def test_a_window_goes_quiet_after_the_timeout(db, client, monkeypatch):
+    clock = Clock(main.utcnow())
+    monkeypatch.setattr(main, "utcnow", clock)
+    admin = mkuser(db, CC, bits=10**9)
+    here = mkuser(db, "here", bits=10**6)
+    login(client, here.id)
+    client.get("/")
+    clock.tick(main.ACTIVE_SECONDS + 5)
+    login(client, admin.id)
+    assert client.get("/admin/live.json").json()["players"][str(here.id)]["active"] is False
+
+
+def test_the_open_page_pings(db, client):
+    player = mkuser(db, "someone", bits=10**6)
+    assert client.get("/api/ping").status_code == 401
+    login(client, player.id)
+    r = client.get("/api/ping")
+    assert r.status_code == 200 and r.json()["ok"] is True
+    db.expire_all()
+    assert db.get(main.User, player.id).last_seen is not None
+    assert "/api/ping" in main.WHEEL_JS and "visibilitychange" in main.WHEEL_JS
+
+
+def test_deltas_csv_splits_the_three_prizes(db, client):
+    admin = mkuser(db, CC, bits=10**9)
+    logos = mkuser(db, "logos", bits=10**8)
+    prefix = mkuser(db, "prefix", bits=10**8)
+    for index, wager in ((12, 2), (13, 3)):               # Static x2, Moving x3
+        spin, _c, _ = main.start_spin(db, logos, wager)
+        force_index(db, spin, index)
+        finish(db, logos, spin)
+    spin, _c, _ = main.start_spin(db, prefix, 5)          # Custom Prefix x5
+    force_index(db, spin, 14)
+    finish(db, prefix, spin)
+    login(client, admin.id)
+    rows = {ln.split(",")[0]: ln.split(",") for ln in
+            client.get("/admin/deltas.csv").text.strip().splitlines()[1:]}
+    assert rows["@logos"][7:] == ["2", "3", "0"]
+    assert rows["@prefix"][7:] == ["0", "0", "5"]
