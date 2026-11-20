@@ -292,8 +292,27 @@ def test_no_rank_sorts_last():
     ("Enforcer", False), ("Sentinel", False), ("Organiser", False), ("", False),
     ("ConquerorEnforcer", False),
 ])
-def test_wager_gate(rank, allowed):
-    assert main.can_wager_multiple(rank) is allowed
+def test_wheel_one_takes_a_wager_from_sovereign(rank, allowed):
+    assert main.can_wager_multiple(rank, 1) is allowed
+
+
+@pytest.mark.parametrize("rank,allowed", [
+    ("Administrator", True), ("Administrator+", True), ("Bronze", True), ("Silver", True),
+    ("Gold", True), ("Platinum", True), ("Founder", True),
+    ("Invincible Administrator+", True),
+    ("Configurator", False), ("Sovereign", False), ("Enforcer", False),
+    ("Herald", False), ("", False),
+])
+def test_wheel_two_takes_a_wager_from_administrator(rank, allowed):
+    assert main.can_wager_multiple(rank, 2) is allowed
+
+
+def test_the_two_wheels_ask_for_different_rungs():
+    assert main.wager_from(1) == "Sovereign"
+    assert main.wager_from(2) == "Administrator"
+    # a Sovereign may wager on Wheel I and not on Wheel II
+    assert main.can_wager_multiple("Sovereign", 1) is True
+    assert main.can_wager_multiple("Sovereign", 2) is False
 
 
 # ===================================================================== bank
@@ -364,7 +383,7 @@ def test_wheel_one_takes_the_whole_range(db):
 
 
 def test_wheel_two_stops_at_ten(db):
-    user = mkuser(db, "u", bits=10 ** 9)
+    user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
     spin, cost, _ = main.start_spin(db, user, 10, wheel=2)
@@ -489,21 +508,59 @@ def test_counts_are_kept_per_wheel(db):
 def test_progress_bars_point_at_the_next_wheel(db):
     user = mkuser(db, "u")
     _spin_n(db, user, 1, 36)
-    assert main.progress_for(db, user, 1) == {"have": 36, "need": 100, "unit": "spins",
-                                             "target": "Wheel II", "secret": False}
-    assert main.progress_for(db, user, 2)["target"] == "Wheel III"
+    bar = main.progress_for(db, user, 1)
+    assert bar["have"] == 36 and bar["need"] == 100 and bar["unit"] == "spins"
+    assert bar["opens"] == "Wheel II" and bar["secret"] is False and bar["open"] is False
+    assert main.progress_for(db, user, 2)["opens"] == "Wheel III"
     assert main.progress_for(db, user, 2)["need"] == 1000
     third = main.progress_for(db, user, 3)
     assert third["secret"] is True and third["need"] == main.SECRET_TARGET
+    assert third["unit"] == "spins"
 
 
-def test_the_third_bar_counts_bits_won_on_wheel_three(db):
+def test_the_third_bar_counts_wheel_three_spins_not_bits(db):
     user = mkuser(db, "u", bits=10 ** 9)
     user.test_unlocked = True
     db.commit()
-    spin_at(db, user, 3, index_of(3, "90,000 BITS"))
-    assert main.secret_progress(db, user.id) == 90_000
-    assert main.progress_for(db, user, 3)["have"] == 90_000
+    spin_at(db, user, 3, index_of(3, "90,000 BITS"))          # a big win
+    assert main.progress_for(db, user, 3)["have"] == 1        # one spin, not 90,000
+    spin_at(db, user, 3, index_of(3, "Bust - 0 BITS"))
+    assert main.progress_for(db, user, 3)["have"] == 2
+
+
+def test_mark_applied_starts_every_bar_again(db):
+    user = mkuser(db, "u", bits=10 ** 12)
+    _spin_n(db, user, 1, 100)                    # Wheel II is now open
+    assert main.progress_for(db, user, 1)["have"] == 100
+
+    # a stamp well after those spins: finish() settles them a few seconds ahead of the clock
+    stamp = main.utcnow() + dt.timedelta(seconds=30)
+    main.meta_set(db, "prizes_applied_at", stamp.isoformat())
+    for u in db.query(main.User).all():
+        u.progress_reset_at = stamp
+    db.commit()
+
+    bar = main.progress_for(db, user, 1)
+    assert bar["have"] == 0                     # the bar starts from nothing
+    assert bar["open"] is True                  # but the wheel stays open
+    assert 2 in main.unlocked_wheels(db, user)
+    assert main.cycle_counts(db, user) == {1: 0, 2: 0, 3: 0}
+    assert main.wheel_counts(db, user.id)[1] == 100           # history is untouched
+
+
+def test_the_bar_counts_from_the_reset_but_not_before_it(db, monkeypatch):
+    user = mkuser(db, "u", bits=10 ** 12)
+    clock = Clock(main.utcnow())
+    monkeypatch.setattr(main, "utcnow", clock)
+    _spin_n(db, user, 1, 3)
+    clock.tick(60)
+    user.progress_reset_at = main.utcnow()
+    db.commit()
+    assert main.progress_for(db, user, 1)["have"] == 0
+    clock.tick(1)
+    _spin_n(db, user, 1, 2)
+    assert main.progress_for(db, user, 1)["have"] == 2        # the new ones count again
+    assert main.wheel_counts(db, user.id)[1] == 5             # and the history is all there
 
 
 # ===================================================================== payouts
@@ -514,7 +571,7 @@ def test_a_bits_prize_is_multiplied_by_the_wager(db):
 
 
 def test_a_wheel_two_prize_is_multiplied_by_the_wager(db):
-    user = mkuser(db, "u", bits=10 ** 9)
+    user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
     spin, cost, _ = spin_at(db, user, 2, index_of(2, "1,500 BITS"), wager=3)
@@ -544,31 +601,59 @@ def test_logos_are_multiplied_by_the_wager_on_wheel_one(db):
     assert main.award_totals(db, user.id)[user.id]["static_logo"] == 30
 
 
-def test_fragments_are_never_multiplied_by_the_wager(db):
-    user = mkuser(db, "u", bits=10 ** 9)
+def test_a_wager_multiplies_fragments(db):
+    user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
     spin, cost, _ = spin_at(db, user, 2, index_of(2, "x2 BITS fragment"), wager=10)
-    assert spin.prize_qty == 1
+    assert spin.prize_qty == 10
+    # ten fragments is three Boosters and one fragment towards the next
+    assert main.award_totals(db, user.id)[user.id]["bits_x2"] == 3
     assert main.fragments_of(db, user.id) == {"frag_x2": 1}
 
 
-def test_finished_boosters_are_never_multiplied_by_the_wager(db):
-    user = mkuser(db, "u", bits=10 ** 9)
+def test_a_wager_multiplies_a_finished_booster(db):
+    """Wheel III has no wager, so the wager is forced on the row to see the rule work."""
+    user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
-    spin, cost, _ = spin_at(db, user, 3, index_of(3, "x20 BITS Booster"))
-    assert spin.prize_qty == 1
-    assert main.award_totals(db, user.id)[user.id]["bits_x20"] == 1
+    spin, cost, _ = main.start_spin(db, user, 1, wheel=3)
+    assert spin.wager == 1
+    spin.wager = 4                                  # as if this wheel had a wager
+    force_index(db, spin, index_of(3, "x20 BITS Booster"))
+    db.commit()
+    later = main.utcnow() + dt.timedelta(seconds=main.REVEAL_AFTER + 1)
+    assert main.reveal_spin(db, user, spin.id, now=later).prize_qty == 4
+    main.claim_spin(db, user, spin.id, now=later)
+    assert main.award_totals(db, user.id)[user.id]["bits_x20"] == 4
 
 
-def test_tokens_are_never_multiplied_by_the_wager(db):
+def test_every_item_on_every_wheel_multiplies_with_the_wager():
+    for wheel in (1, 2, 3):
+        for slice_ in main.slices(wheel):
+            if slice_["kind"] == "item":
+                assert slice_["scales"] is True, (wheel, slice_["label"])
+            if slice_["kind"] == "free":
+                assert slice_["scales"] is False, (wheel, slice_["label"])
+
+
+def test_a_wager_multiplies_tokens(db):
     user = mkuser(db, "u", bits=10 ** 9)
+    main.give_award(db, user.id, "legacy_token", 3 * 4)
+    db.commit()
+    assert main.award_totals(db, user.id)[user.id]["legacy_token"] == 12
+
+
+def test_a_wager_never_multiplies_free_spins(db):
+    """The count is fixed on purpose: each free spin already carries the wager it was won
+    at, so multiplying the count as well would apply the wager twice."""
+    user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
-    spin, cost, _ = spin_at(db, user, 3, index_of(3, "3 Legacy Tokens"))
-    assert spin.prize_qty == 3
-    assert main.award_totals(db, user.id)[user.id]["legacy_token"] == 3
+    spin, cost, _ = spin_at(db, user, 2, index_of(2, "5 More Spins"), wager=10)
+    assert spin.prize_qty == 5
+    state = main.free_state(db, user, 2)
+    assert state["count"] == 5 and state["wager"] == 10
 
 
 def test_claiming_twice_pays_once(db):
@@ -634,7 +719,7 @@ def test_free_spins_belong_to_the_wheel_that_paid_them(db):
 
 
 def test_a_free_spin_costs_nothing_and_keeps_its_wager(db):
-    user = mkuser(db, "u", bits=10 ** 9)
+    user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
     spin_at(db, user, 2, index_of(2, "5 More Spins"), wager=4)
@@ -989,6 +1074,43 @@ def test_the_bits_sentence_is_plain(db):
     assert "minus" in main.delta_line(-500)
 
 
+def test_the_model_knows_every_column_the_migration_adds(db):
+    """A column added by ALTER but missing from the model is written nowhere and read as
+    None. That is how progress_reset_at slipped through the first time."""
+    for table, column, _kind in main.COLUMN_ADDITIONS:
+        assert column in main.Base.metadata.tables[table].columns, (table, column)
+
+
+def test_mark_applied_really_writes_the_bar_reset(db, client):
+    admin = mkuser(db, CC, bits=10 ** 9, admin=True)
+    user = mkuser(db, "u", bits=10 ** 9)
+    login(client, admin.id)
+    client.post("/admin/apply")
+    db.expire_all()
+    assert db.get(main.User, user.id).progress_reset_at is not None
+
+
+def test_one_bad_column_does_not_stop_the_others(db, monkeypatch):
+    """The deploy that broke: one rejected ALTER used to abandon the whole migration."""
+    with main.engine.begin() as conn:
+        conn.execute(main.text("ALTER TABLE users DROP COLUMN test_unlocked"))
+        conn.execute(main.text("ALTER TABLE spins DROP COLUMN wheel"))
+    good = main.column_ddl
+
+    def fake(table, column, kind, dialect="sqlite"):
+        if column == "test_unlocked":
+            return "ALTER TABLE users ADD COLUMN"        # a syntax error, not a type
+        return good(table, column, kind, dialect)
+
+    monkeypatch.setattr(main, "column_ddl", fake)
+    assert main.ensure_columns() is False         # it says so, rather than pretending
+    assert "wheel" in {c["name"] for c in main.inspect(main.engine).get_columns("spins")}
+
+    monkeypatch.setattr(main, "column_ddl", good)
+    assert main.ensure_columns() is True
+    assert "test_unlocked" in {c["name"] for c in main.inspect(main.engine).get_columns("users")}
+
+
 def test_the_local_login_answers_with_a_see_other(db, client, monkeypatch):
     """307 would make the browser re-POST the form to "/" and land on a 405."""
     monkeypatch.setattr(main, "ALLOW_LOCAL", True)
@@ -1172,6 +1294,23 @@ def test_api_me_returns_all_three_wheels(db, client):
     assert d["multi"] is True and d["jackpot"] == 0
 
 
+def test_api_me_carries_the_gate_of_each_wheel(db, client):
+    user = mkuser(db, "u", rank="Sovereign")
+    login(client, user.id)
+    d = client.get("/api/me").json()
+    assert d["wheels"][0]["multi"] is True and d["wheels"][0]["wagerFrom"] == "Sovereign"
+    assert d["wheels"][1]["multi"] is False and d["wheels"][1]["wagerFrom"] == "Administrator"
+
+
+def test_api_me_carries_the_bar_of_each_wheel(db, client):
+    user = mkuser(db, "u")
+    login(client, user.id)
+    d = client.get("/api/me").json()
+    third = d["wheels"][2]["progress"]
+    assert third["secret"] is True and third["unit"] == "spins"
+    assert d["wheels"][0]["progress"]["opens"] == "Wheel II"
+
+
 def test_api_spin_and_claim_walk_the_whole_way(db, client):
     user = mkuser(db, "u", bits=10_000)
     login(client, user.id)
@@ -1289,10 +1428,38 @@ def test_the_prize_csv_keeps_emoji_out(db, client):
 
 # ===================================================================== upgrades
 def test_ensure_columns_is_idempotent(db):
-    main.ensure_columns()
-    main.ensure_columns()
+    assert main.ensure_columns() is True
+    assert main.ensure_columns() is True
     names = {c["name"] for c in main.inspect(main.engine).get_columns("spins")}
     assert {"wheel", "note"} <= names
+
+
+def test_ensure_columns_adds_every_column_it_promises(db):
+    main.ensure_columns()
+    for table, column, _kind in main.COLUMN_ADDITIONS:
+        names = {c["name"] for c in main.inspect(main.engine).get_columns(table)}
+        assert column in names, (table, column)
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "postgresql"])
+def test_a_boolean_default_is_spelled_the_same_everywhere(dialect):
+    """PostgreSQL rejects BOOLEAN DEFAULT 0 outright. That one line broke the first deploy."""
+    ddl = main.column_ddl("users", "test_unlocked", "bool", dialect)
+    assert "BOOLEAN DEFAULT FALSE" in ddl
+    assert "DEFAULT 0" not in ddl
+
+
+@pytest.mark.parametrize("dialect,stamp", [
+    ("sqlite", "TIMESTAMP"), ("postgresql", "TIMESTAMP WITH TIME ZONE")])
+def test_the_timestamp_type_follows_the_database(dialect, stamp):
+    ddl = main.column_ddl("users", "progress_reset_at", "stamp", dialect)
+    assert ddl == "ALTER TABLE users ADD COLUMN progress_reset_at " + stamp
+
+
+def test_every_addition_is_a_plain_add_column():
+    for table, column, kind in main.COLUMN_ADDITIONS:
+        assert main.column_ddl(table, column, kind, "postgresql").startswith(
+            "ALTER TABLE %s ADD COLUMN %s " % (table, column))
 
 
 def test_an_old_database_keeps_its_rows(db):
