@@ -39,7 +39,7 @@ import openpyxl
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from sqlalchemy import (BigInteger, Boolean, Column, DateTime, ForeignKey, Integer, String,
-                        Text, create_engine, func, select)
+                        Text, and_, create_engine, func, inspect, select, text)
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # --------------------------------------------------------------------------- config
@@ -102,8 +102,10 @@ SPIN_TTL = int(env("BS_SPIN_TTL_SECONDS", "30"))
 # The wheel must actually turn before the result is revealed. Anything closed before this
 # many seconds is a forfeit, which is the whole point of the timer.
 REVEAL_AFTER = float(env("BS_REVEAL_SECONDS", "3.6"))
+ACTIVE_SECONDS = int(env("BS_ACTIVE_SECONDS", "150"))   # a page that pinged this recently is "open"
+PING_EVERY = int(env("BS_PING_SECONDS", "45"))          # how often the page says it is still there
 FREE_SPIN_AWARD = 2                    # "2 More Spins" hands over exactly two
-MAX_WAGER = int(env("BS_MAX_WAGER", "1000000000"))
+MAX_WAGER = int(env("BS_MAX_WAGER", "50000"))
 WAGER_MIN_RANK = env("BS_WAGER_MIN_RANK", "Sovereign")
 
 # The real wheel, from wheelofnames.com/2px-y84: same 16 slices, same order,
@@ -197,6 +199,7 @@ class User(Base):
     prestige = Column(Integer, default=0)
     bank_synced_at = Column(DateTime(timezone=True))
     applied_through = Column(Integer, default=0)
+    last_seen = Column(DateTime(timezone=True))     # last time this player had the page open
 
 
 class Ledger(Base):
@@ -251,6 +254,33 @@ engine = create_engine(DB_URL, future=True,
                           if DB_URL.startswith("sqlite") else {}))
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 Base.metadata.create_all(engine)
+
+
+def touch(db, user, force=False):
+    """Remember that this player has the page open.
+
+    Written at most once every 20 seconds per player, so a busy page does not turn into a
+    busy database.
+    """
+    if not user:
+        return
+    now = utcnow()
+    last = _aware(user.last_seen) if user.last_seen else None
+    if not force and last and (now - last).total_seconds() < 20:
+        return
+    user.last_seen = now
+    db.commit()
+
+
+def is_active(user, now=None):
+    if not user or not user.last_seen:
+        return False
+    now = now or utcnow()
+    return (now - _aware(user.last_seen)).total_seconds() <= ACTIVE_SECONDS
+
+
+def seen_iso(user):
+    return _aware(user.last_seen).isoformat() if user and user.last_seen else ""
 
 
 def get_db():
@@ -727,6 +757,26 @@ padding:10px 14px;border-radius:12px;margin:12px 0}
 .result{min-height:56px;display:flex;align-items:center;justify-content:center;
 font-family:Georgia,serif;font-size:1.45rem;color:var(--gold);text-align:center}
 footer{margin-top:32px;color:var(--muted);font-size:.8rem;text-align:center}
+/* sortable headings */
+th.sortable{padding:0}
+th.sortable button{all:unset;cursor:pointer;display:flex;align-items:center;gap:5px;width:100%;
+padding:8px 10px;font:inherit;color:inherit;letter-spacing:inherit;text-transform:inherit}
+th.sortable button:hover{color:var(--ink)}
+th.sortable .arrow{opacity:.25;font-size:.72rem;line-height:1}
+th.sortable.on{color:var(--ink)}
+th.sortable.on .arrow{opacity:1;color:var(--gold)}
+/* who is on the page */
+.who{display:inline-flex;align-items:center;gap:0}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;
+flex:0 0 auto;background:#3a4354;vertical-align:middle}
+.dot.live{background:var(--good);animation:dotpulse 1.9s ease-out infinite}
+@keyframes dotpulse{
+0%{box-shadow:0 0 0 0 rgba(74,222,128,.55)}
+70%{box-shadow:0 0 0 7px rgba(74,222,128,0)}
+100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}}
+@media(prefers-reduced-motion:reduce){.dot.live{animation:none;box-shadow:0 0 0 2px rgba(74,222,128,.35)}}
+.lastspin{white-space:nowrap}
+.lastspin .ago{color:var(--muted);font-size:.78rem;margin-left:7px}
 """
 
 # The wheel is drawn exactly like wheelofnames: pastel slices, dark text, white hub,
@@ -1070,6 +1120,17 @@ if (COST !== 300) {
 setCost(wager);
 drawWheel();
 loadLog();
+
+/* Tell the admin page this window is still open. Only while the tab is visible, so a
+   forgotten tab does not look like somebody sitting in front of it. */
+const PING_MS = %(ping)d * 1000;
+function ping(){
+  if (document.visibilityState === 'hidden') return;
+  fetch('/api/ping', {cache: 'no-store'}).catch(() => {});
+}
+ping();
+setInterval(ping, PING_MS);
+document.addEventListener('visibilitychange', ping);
 """
 
 
@@ -1150,7 +1211,7 @@ def index_page(user, state, slices_json):
                 'is not in the BITS Bank yet, say so in the team chat and it gets added.'
                 % (SPIN_COST, esc(BITS_HELP)))
     js = WHEEL_JS % {"slices": slices_json, "ttl": SPIN_TTL, "cost": SPIN_COST,
-                     "multi": "true" if multi else "false",
+                     "multi": "true" if multi else "false", "ping": PING_EVERY,
                      "free": json.dumps(state.get("free"))}
     return page("""
 <header class=top><div class=brand>Real Humans · <b>Mystery BITS</b></div>
@@ -1280,6 +1341,81 @@ PLAYER_MODAL = """
   document.querySelectorAll('tr.prow').forEach(function(tr){
     tr.addEventListener('click', function(){ open(tr.dataset.uid); });
   });
+
+  /* ---- sorting: first click puts the biggest number on top, the second turns it round */
+  (function(){
+    var tbl = document.getElementById('playersTbl');
+    if (!tbl) return;
+    var body = tbl.tBodies[0];
+    var order = {col: -1, asc: false};
+
+    function value(tr, col, type){
+      var cell = tr.cells[col];
+      var raw = cell ? cell.getAttribute('data-v') : '';
+      if (raw === null) raw = '';
+      return (type === 'num') ? Number(raw || 0) : String(raw);
+    }
+    function apply(th, asc){
+      var col = Number(th.getAttribute('data-col'));
+      var type = th.getAttribute('data-type') || 'text';
+      var rows = Array.prototype.slice.call(body.rows);
+      rows.sort(function(a, b){
+        var x = value(a, col, type), y = value(b, col, type);
+        var cmp = (type === 'num') ? (x - y)
+          : String(x).localeCompare(String(y), 'en', {numeric: true, sensitivity: 'base'});
+        return asc ? cmp : -cmp;
+      });
+      rows.forEach(function(r){ body.appendChild(r); });
+      tbl.querySelectorAll('th.sortable').forEach(function(o){
+        var on = (o === th);
+        o.classList.toggle('on', on);
+        o.querySelector('.arrow').textContent = on ? (asc ? '\u25B2' : '\u25BC') : '\u21C5';
+      });
+      order = {col: col, asc: asc};
+      try { localStorage.setItem('bs_admin_sort', JSON.stringify(order)); } catch (e) {}
+    }
+    tbl.querySelectorAll('th.sortable').forEach(function(th){
+      th.addEventListener('click', function(){
+        var col = Number(th.getAttribute('data-col'));
+        apply(th, (order.col === col) ? !order.asc : false);
+      });
+    });
+    try {                                           /* keep the sort across a reload */
+      var saved = JSON.parse(localStorage.getItem('bs_admin_sort') || 'null');
+      if (saved && saved.col >= 0) {
+        var th = tbl.querySelector('th.sortable[data-col="' + saved.col + '"]');
+        if (th) apply(th, !!saved.asc);
+      }
+    } catch (e) {}
+  })();
+
+  /* ---- who is on the page: a green dot that pulses, updated in place so the order holds */
+  (function(){
+    var note = document.getElementById('liveNote');
+    function tick(){
+      fetch('/admin/live.json', {cache: 'no-store'}).then(function(r){
+        return r.ok ? r.json() : null;
+      }).then(function(d){
+        if (!d) return;
+        var count = 0;
+        document.querySelectorAll('tr.prow').forEach(function(tr){
+          var info = d.players[tr.getAttribute('data-uid')] || {};
+          var dot = tr.querySelector('.dot');
+          if (!dot) return;
+          var live = !!info.active;
+          if (live) count++;
+          dot.classList.toggle('live', live);
+          dot.title = live ? 'on the page now' :
+            (info.seen_ago ? ('last seen ' + info.seen_ago) : 'has not opened the page yet');
+        });
+        if (note) note.textContent = count
+          ? ('\u00b7 ' + count + ' on the page right now \u00b7 updated ' + new Date().toLocaleTimeString())
+          : ('\u00b7 nobody has the page open \u00b7 updated ' + new Date().toLocaleTimeString());
+      }).catch(function(){});
+    }
+    setInterval(tick, 15000);
+    tick();
+  })();
 })();
 </script>
 """
@@ -1292,18 +1428,68 @@ def nicetime(raw):
         return ""
 
 
+def ago(raw):
+    """'4m ago', '3h ago', for the last spin column."""
+    if not raw:
+        return ""
+    try:
+        when = _aware(dt.datetime.fromisoformat(raw))
+    except (TypeError, ValueError):
+        return ""
+    secs = (utcnow() - when).total_seconds()
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return "%dm ago" % int(secs // 60)
+    if secs < 86400:
+        return "%dh ago" % int(secs // 3600)
+    return "%dd ago" % int(secs // 86400)
+
+
+PLAYER_COLS = [("Player", "text"), ("Rank", "text"), ("Bank", "num"), ("Delta", "num"),
+               ("Available", "num"), ("Spins", "num"), ("Staked", "num"),
+               ("Last Spin", "time"), ("Account", "text")]
+
+
 def admin_page(rows, prizes, meta):
-    body = "".join(
-        "<tr class=prow data-uid=\"%d\" title=\"Click for this player's spins\">"
-        "<td>@%s%s</td><td>%s</td><td class=mono>%s</td><td class=mono>%s</td>"
-        "<td class=mono>%s</td><td class=mono>%s</td><td class=mono>%s</td><td>%s</td></tr>"
-        % (r["id"], esc(r["display"]),
-           (' <span class="pill no">\U0001F621 %d</span>' % r["forfeits"]) if r["forfeits"] else "",
-           esc(r["rank"] or "-"), f"{r['bank']:,}", f"{r['delta']:+,}",
-           f"{r['available']:,}", r["spins"], f"{r['staked']:,}",
-           '<span class="pill ok">in bank</span>' if r["in_bank"] else
-           '<span class="pill no">not in bank</span>')
-        for r in rows)
+    def row_html(r):
+        last = ""
+        if r.get("last_at"):
+            what = (r["last_emoji"] + " " + r["last_label"]).strip() or r["last_status"]
+            when = ago(r["last_at"])
+            last = ('<span class=lastspin>%s<span class=ago title="%s">%s</span></span>'
+                    % (esc(what), esc(nicetime(r["last_at"])), esc(when)))
+        else:
+            last = '<span class=hint>never</span>'
+        return (
+            "<tr class=prow data-uid=\"%d\" title=\"Click for this player's spins\">"
+            "<td data-v=\"%s\"><span class=who><span class=\"dot%s\" title=\"%s\"></span>@%s</span>%s</td>"
+            "<td data-v=\"%s\">%s</td>"
+            "<td class=mono data-v=\"%d\">%s</td>"
+            "<td class=mono data-v=\"%d\">%s</td>"
+            "<td class=mono data-v=\"%d\">%s</td>"
+            "<td class=mono data-v=\"%d\">%s</td>"
+            "<td class=mono data-v=\"%d\">%s</td>"
+            "<td data-v=\"%s\">%s</td>"
+            "<td data-v=\"%s\">%s</td></tr>"
+            % (r["id"],
+               esc(str(r["display"]).lower()),
+               " live" if r.get("active") else "",
+               "on the page now" if r.get("active") else "not on the page",
+               esc(r["display"]),
+               (' <span class="pill no">\U0001F621 %d</span>' % r["forfeits"]) if r["forfeits"] else "",
+               esc(str(r["rank"] or "").lower()), esc(r["rank"] or "-"),
+               r["bank"], f"{r['bank']:,}",
+               r["delta"], f"{r['delta']:+,}",
+               r["available"], f"{r['available']:,}",
+               r["spins"], r["spins"],
+               r["staked"], f"{r['staked']:,}",
+               esc(r.get("last_at") or ""), last,
+               "1" if r["in_bank"] else "0",
+               '<span class="pill ok">in bank</span>' if r["in_bank"] else
+               '<span class="pill no">not in bank</span>'))
+
+    body = "".join(row_html(r) for r in rows)
     prize_rows = "".join("<tr><td>@%s</td><td>%s %s</td><td class=mono>%s</td></tr>"
                          % (esc(p["display"]), emoji_of(p["label"]), esc(p["label"]),
                             f"{p['qty']:,}")
@@ -1311,6 +1497,10 @@ def admin_page(rows, prizes, meta):
     if not prize_rows:
         prize_rows = ('<tr><td colspan=3 class=hint style="padding:14px 6px">Nothing owed right now.'
                       '</td></tr>')
+    player_head = "".join(
+        '<th class=sortable data-col="%d" data-type="%s"><button type=button>%s'
+        '<span class=arrow>\u21C5</span></button></th>' % (i, kind, esc(label))
+        for i, (label, kind) in enumerate(PLAYER_COLS))
     cleared = nicetime(meta.get("prizes_since") or "")
     cleared_note = ("Cleared " + cleared + "." if cleared else
                     "Nothing cleared yet, so this is every prize ever won.")
@@ -1322,8 +1512,8 @@ def admin_page(rows, prizes, meta):
   <div class=lab>Since your last update</div>
   <p class=hint>Everything you have to do is in one file: <b>Deltas + prizes</b>. Type each delta
   into column H of the sheet (that moves J, and J − P×1e6 is the spending figure), hand out the
-  prizes in the last column, then <b>Sync bank</b> and <b>Mark applied</b>. Nothing is written
-  for you. Mark applied sets both lists back to zero: the Deltas file and the prize obligations
+  prizes in the three logo columns, then <b>Sync bank</b> and <b>Mark applied</b>. Nothing is
+  written for you. Mark applied sets both lists back to zero: the Deltas file and the prize obligations
   below. Someone marked <i>not in bank</i> has no BITS, so they cannot spin yet.</p>
   <form method=post action="/admin/sync" style="display:inline"><button class=primary>Sync bank</button></form>
   <form method=post action="/admin/apply" style="display:inline"
@@ -1338,15 +1528,17 @@ def admin_page(rows, prizes, meta):
 </div>
 <div class=card style="margin-bottom:18px"><div class=lab>Prize obligations</div>
   <p class=hint>A wager of 30,000 landing on Moving Logo owes 30,000 moving logos. Only prizes won
-  since the last <b>Mark applied</b> are listed: pressing it empties this card and the prizes_owed
-  column of the Deltas file. <i>%s</i></p>
+  since the last <b>Mark applied</b> are listed: pressing it empties this card and the three
+  prize columns of the Deltas file. <i>%s</i></p>
   <table><thead><tr><th>Player</th><th>Prize</th><th>Owed</th></tr></thead><tbody>%s</tbody></table></div>
 <div class=card><div class=lab>Players</div>
-  <table><thead><tr><th>Player</th><th>Rank</th><th>Bank</th><th>Delta</th><th>Available</th>
-  <th>Spins</th><th>Staked</th><th>Account</th></tr></thead><tbody>%s</tbody></table></div>
+  <p class=hint>Click a heading to sort: the first click puts the biggest number on top, the
+  second click turns it round. A green dot means that player has the page open right now;
+  grey means they do not. <span id=liveNote class=hint></span></p>
+  <table id=playersTbl><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>
 <footer>Admin is the Lichess account @CC_Prestiged.</footer>
 """ % (meta["bank_players"], esc(meta["bank_synced_at"] or "never"), cleared_note,
-       prize_rows, body) + PLAYER_MODAL)
+       prize_rows, player_head, body) + PLAYER_MODAL)
 
 
 # --------------------------------------------------------------------------- app
@@ -1397,9 +1589,29 @@ def ensure_admin_flag(db, user):
         db.commit()
 
 
+def ensure_columns():
+    """Add last_seen to a database that was created before it existed.
+
+    A site like this is deployed once and then kept, so the table is patched in place
+    rather than dropped and rebuilt.
+    """
+    try:
+        names = {c["name"] for c in inspect(engine).get_columns("users")}
+    except Exception:
+        return
+    if "last_seen" in names:
+        return
+    ddl = ("ALTER TABLE users ADD COLUMN last_seen TIMESTAMP"
+           if engine.dialect.name == "sqlite"
+           else "ALTER TABLE users ADD COLUMN last_seen TIMESTAMP WITH TIME ZONE")
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+
+
 @app.on_event("startup")
 def _startup():
     Base.metadata.create_all(engine)
+    ensure_columns()
 
 
 @app.get("/emoji-sheet.png")
@@ -1420,6 +1632,7 @@ def home(request: Request, db=Depends(get_db)):
     user = current_user(request, db)
     if not user:
         return Response(login_page(), media_type="text/html")
+    touch(db, user, force=True)
     slices = json.dumps([{k: v for k, v in slice_.items() if k != "weight"} for slice_ in WHEEL],
                         ensure_ascii=False)
     return Response(index_page(user, state_of(db, user), slices), media_type="text/html")
@@ -1505,6 +1718,7 @@ def api_me(request: Request, db=Depends(get_db)):
     user = current_user(request, db)
     if not user:
         return JSONResponse({"detail": "not signed in"}, status_code=401)
+    touch(db, user)
     s = state_of(db, user)
     s.update({"display": user.display, "cost_per_wager": SPIN_COST, "ttl": SPIN_TTL,
               "reveal_after": REVEAL_AFTER, "free_spins": free_state(db, user),
@@ -1512,11 +1726,22 @@ def api_me(request: Request, db=Depends(get_db)):
     return s
 
 
+@app.get("/api/ping")
+def api_ping(request: Request, db=Depends(get_db)):
+    """The open page says hello, so the admin can see who is actually there."""
+    user = current_user(request, db)
+    if not user:
+        return JSONResponse({"ok": False}, status_code=401)
+    touch(db, user, force=True)
+    return {"ok": True, "now": utcnow().isoformat(), "active_seconds": ACTIVE_SECONDS}
+
+
 @app.post("/api/spin")
 async def api_spin(request: Request, db=Depends(get_db)):
     user = current_user(request, db)
     if not user:
         return JSONResponse({"detail": "not signed in"}, status_code=401)
+    touch(db, user)
     try:
         body = await request.json()
     except Exception:                                     # noqa: BLE001
@@ -1583,11 +1808,23 @@ def api_spins(request: Request, db=Depends(get_db)):
 
 
 # --- admin
+PRIZE_COLUMNS = ["Static Logo", "Moving Logo", "Custom Prefix"]   # columns H, I, J of the export
+
+
 def emoji_of(label):
     for slice_ in WHEEL:
         if slice_["label"] == label:
             return slice_["emoji"]
     return ""
+
+
+def last_spin_of(db):
+    """The newest spin of every player, in one round trip."""
+    latest = (select(Spin.user_id, func.max(Spin.created_at).label("when_"))
+              .group_by(Spin.user_id).subquery())
+    q = (select(Spin).join(latest, and_(Spin.user_id == latest.c.user_id,
+                                        Spin.created_at == latest.c.when_)))
+    return {s.user_id: s for s in db.execute(q).scalars()}
 
 
 def admin_rows(db):
@@ -1596,17 +1833,26 @@ def admin_rows(db):
     left = dict(db.execute(select(Spin.user_id, func.count(Spin.id))
                            .where(Spin.status == "forfeited")
                            .group_by(Spin.user_id)).all())
+    newest = last_spin_of(db)
+    now = utcnow()
     out = []
     for u in db.query(User).order_by(User.id).all():
         delta = delta_for(db, u.id, u.applied_through or 0)
         cnt, staked = db.execute(select(func.count(Spin.id), func.coalesce(func.sum(Spin.cost), 0))
                                  .where(Spin.user_id == u.id)).one()
+        spin = newest.get(u.id)
         out.append({"id": u.id, "display": u.display or u.lichess_id, "rank": u.bank_rank or "",
                     "bank": int(u.bank_bits or 0), "delta": delta,
                     "available": int(u.bank_bits or 0) + delta, "spins": cnt,
                     "staked": int(staked or 0),
                     "in_bank": name_key(u.lichess_id) in known,
-                    "forfeits": int(left.get(u.id, 0))})
+                    "forfeits": int(left.get(u.id, 0)),
+                    "last_label": (spin.label or "") if spin else "",
+                    "last_emoji": emoji_of(spin.label) if spin else "",
+                    "last_status": (spin.status or "") if spin else "",
+                    "last_at": _aware(spin.created_at).isoformat() if spin and spin.created_at else "",
+                    "last_seen": seen_iso(u),
+                    "active": is_active(u, now)})
     return out
 
 
@@ -1697,6 +1943,19 @@ def admin_apply(request: Request, db=Depends(get_db)):
     return RedirectResponse("/admin", status_code=303)
 
 
+@app.get("/admin/live.json")
+def admin_live(request: Request, db=Depends(get_db)):
+    """Who has the page open right now, for the dots on the admin table."""
+    if not admin_guard(request, db):
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
+    now = utcnow()
+    out = {}
+    for u in db.query(User).all():
+        out[str(u.id)] = {"active": is_active(u, now), "seen": seen_iso(u),
+                          "seen_ago": ago(seen_iso(u)) if u.last_seen else ""}
+    return {"now": now.isoformat(), "active_seconds": ACTIVE_SECONDS, "players": out}
+
+
 @app.get("/admin/player/{uid}.json")
 def admin_player_json(uid: int, request: Request, db=Depends(get_db)):
     if not admin_guard(request, db):
@@ -1742,16 +2001,19 @@ def admin_deltas(request: Request, db=Depends(get_db)):
     w = csv.writer(buf)
     owed = {}
     for p in prize_rows(db):
-        owed.setdefault(name_key(p["display"]), []).append(
-            "%s x%s" % (p["label"], f"{p['qty']:,}"))
+        key = name_key(p["display"])
+        mine = owed.setdefault(key, {})
+        mine[p["label"]] = mine.get(p["label"], 0) + int(p["qty"])
     w.writerow(["username", "rank", "spending_before", "delta_to_type_into_H",
-                "spending_after", "spins", "staked", "prizes_owed"])
+                "spending_after", "spins", "staked", "static_logos", "moving_logos",
+                "custom_prefixes"])
     for r in admin_rows(db):
-        prizes = "; ".join(owed.get(name_key(r["display"]), []))
-        if r["delta"] == 0 and r["spins"] == 0 and not prizes:
+        mine = owed.get(name_key(r["display"]), {})
+        counts = [int(mine.get(label, 0)) for label in PRIZE_COLUMNS]
+        if r["delta"] == 0 and r["spins"] == 0 and not any(counts):
             continue
         w.writerow(["@" + str(r["display"]).lstrip("@"), r["rank"], r["bank"], r["delta"],
-                    r["available"], r["spins"], r["staked"], prizes])
+                    r["available"], r["spins"], r["staked"]] + counts)
     return PlainTextResponse(buf.getvalue(), media_type="text/csv",
                              headers={"Content-Disposition": 'attachment; filename="rh-deltas.csv"'})
 
