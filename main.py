@@ -1691,12 +1691,6 @@ function renderOdds() {
       '<em>' + s.emoji + '</em><b>' + s.label + tag + '</b><span class=pct>' +
       s.pct.toFixed(2) + '%</span></li>';
   }).join('');
-  const avg = w.average;
-  document.getElementById('oddsFoot').textContent =
-    'A spin costs ' + money(w.cost) + ' BITS' +
-    (w.wager ? ' (or a multiple of it)' : '') + '. Over a great many spins the wheel hands ' +
-    'back about ' + money(Math.round(avg.per)) + ' BITS a spin, which is ' + avg.pct +
-    '% of the price. Anything that is not BITS is left out of that figure.';
 }
 
 function renderHud() {
@@ -2109,8 +2103,6 @@ it. A spin left before the wheel stops keeps its <span class=j>30,000</span> in 
 
 <section data-ow="1,2,3" hidden>
 <h4>What the bar counts</h4>
-
-<h4>What the bar counts</h4>
 <p><span class=p>Finished spins</span>, not BITS, and all of them: the bar under Wheel I
 counts your finished Wheel I spins, from the first one onwards. Nothing ever takes those back.
 A spin you leave before the wheel stops is the one thing that does not count. The last bar
@@ -2196,7 +2188,6 @@ def index_page(user, payload, delta):
 <details class="card oddsbox" id=oddsBox open>
   <summary><span class=lab id=oddsTitle></span><span class=more>hide</span></summary>
   <ol id=oddsList></ol>
-  <div class=hint id=oddsFoot style="margin-top:12px"></div>
 </details>
 <div class="card" style="margin-top:18px">%s</div>
 <div class=card style="margin-top:20px"><div class=lab>Your spins</div>
