@@ -26,9 +26,10 @@ Rules this file implements
 * BITS prizes scale  = a wager of 30 landing on 1,500 BITS owes 45,000
 * items scale too    = a wager of 10 on a fragment is ten fragments, which is
                        three Boosters and one over. A slice may carry a cap that
-                       one spin cannot pass (fragments 20, Wheel II free spins 50,
-                       x10 BITS 5, x20 BITS 3, Legacy x3/x5 3). The cap is per
-                       spin; a player can hold any number of anything
+                       one spin cannot pass: free spins 10 on Wheel I and 50 on
+                       Wheel II, fragments 20, x10 BITS 5, x20 BITS 3, Legacy x3/x5
+                       3. The cap is per spin; a player can hold any number of
+                       anything
 * fragments          = 3 of the same fragment make one Booster, automatically.
                        Fragments are kept forever; boosters are owed to the
                        player and cleared by Mark applied.
@@ -36,10 +37,11 @@ Rules this file implements
                        to. Nothing clears a bar; Mark applied only clears the deltas
                        and the prize obligations. The last bar counts Wheel III
                        spins and says nothing about what is behind it.
-* jackpot            = every paid Wheel III spin drops the plain 30,000 into one
-                       pot, never the wager. The pot is paid out the moment
-                       somebody lands on the jackpot, and then starts again from
-                       zero.
+* jackpot            = every paid Wheel III spin drops everything it cost into
+                       one pot, so a x10 feeds it 300,000. The pot is paid out the
+                       moment somebody lands on the jackpot and starts again from
+                       zero; the wager does not multiply the payout, only the
+                       feeding.
 * reload before the spin settles = the wager is gone, the sweep keeps it
 * admin              = the Lichess account in BS_ADMIN_LICHESS (CC_Prestiged)
 
@@ -196,7 +198,7 @@ WHEEL_1 = [
     _s("Custom Prefix", ["Custom", "Prefix"], "\U0001F9EC", "1f9ec", "item", 625, "#b8d8f2",
        amount=1, key="custom_prefix", scales=True),
     _s("2 More Spins", ["2 more", "spins"], "\U0001F504", "1f504", "free", 625, "#a8dfe8",
-       amount=FREE_SPIN_AWARD),
+       amount=FREE_SPIN_AWARD, scales=True, cap=10),
 ]
 
 # --- Wheel II: grey and purple, the wind between the hills. 13 slices.
@@ -868,9 +870,10 @@ def start_spin(db, user, wager, free=False, wheel=1):
     if cost:
         db.add(Ledger(user_id=user.id, spin_id=spin.id, delta=-cost, reason="spin"))
         if wheel == 3:
-            # a Cataclysm spin drops the plain price into the shared pot, whatever the
-            # wager was: the jackpot is the one thing a wager does not touch
-            jackpot_add(db, wheel_cost(3))
+            # a Cataclysm spin drops everything it cost into the shared pot, so a x10 feeds
+            # it ten times over. What a wager does not do is multiply the payout: whoever
+            # lands on the jackpot takes the pot as it stands.
+            jackpot_add(db, cost)
     db.commit()
     return spin, cost, balance - cost
 
@@ -1381,13 +1384,23 @@ flex-wrap:wrap;margin-bottom:9px}
 .pbar{height:15px;border-radius:999px;background:rgba(255,255,255,.07);position:relative;
 overflow:hidden;box-shadow:inset 0 1px 3px rgba(0,0,0,.55)}
 #progTicks{position:absolute;inset:0;display:block;pointer-events:none}
-.pbar .mk{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;border-radius:2px;
-background:rgba(8,12,18,.75);box-shadow:0 0 0 1px rgba(255,255,255,.28)}
-.pbar .mk.on{background:rgba(255,255,255,.9);box-shadow:0 0 8px var(--glow)}
+.pbar .mk{position:absolute;top:4px;width:7px;height:7px;margin-left:-3.5px;border-radius:1px;
+transform:rotate(45deg);background:rgba(9,13,19,.92);
+box-shadow:0 0 0 1.5px rgba(255,255,255,.34);transition:background .3s,box-shadow .3s}
+/* a diamond has to read on green as well as on gold, so it goes white with a dark ring */
+.pbar .mk.on{background:#ffffff;
+box-shadow:0 0 0 1.5px rgba(12,16,24,.85),0 0 10px rgba(255,236,190,.95),0 0 22px rgba(255,208,138,.5)}
+@keyframes mkpop{0%{box-shadow:0 0 0 0 rgba(255,208,138,.9)}
+70%{box-shadow:0 0 0 13px rgba(255,208,138,0)}
+100%{box-shadow:0 0 0 0 rgba(255,208,138,0)}}
+.pbar .mk.ping{animation:mkpop 1.2s ease-out 2}
+@media(prefers-reduced-motion:reduce){.pbar .mk.ping{animation:none}}
 .progmarks{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 .progmarks span{font-size:.76rem;color:var(--muted);border:1px solid var(--line);
-border-radius:999px;padding:2px 9px;white-space:nowrap}
-.progmarks span.on{color:var(--acc);border-color:var(--acc);background:rgba(255,255,255,.05)}
+border-radius:999px;padding:2px 9px;white-space:nowrap;
+transition:color .3s,border-color .3s,background .3s}
+.progmarks span.on{color:#ffe1a6;border-color:rgba(255,208,138,.55);
+background:rgba(255,208,138,.10)}
 .pbar>i{display:block;height:100%;border-radius:999px;width:0;
 background:linear-gradient(90deg,var(--acc2),var(--acc));
 box-shadow:0 0 10px var(--glow),0 0 26px var(--glow);transition:width .8s cubic-bezier(.2,.8,.2,1)}
@@ -1533,6 +1546,7 @@ const W = {};
 DATA.wheels.forEach(w => { W[w.id] = w; });
 let active = DATA.active || 1;
 const wagered = {1: 1, 2: 1, 3: 1};
+const SEEN = {};            // which marks have already been reached in this visit
 
 /* The wheel is drawn inside a 600 x 600 square and CSS scales it by width alone
    (height:auto, and the canvas is square in its own pixels), so it stays a circle at any
@@ -1717,12 +1731,29 @@ function renderProgress() {
   bar.parentNode.setAttribute('aria-valuenow', Math.round(pct));
 
   /* The marks are the two things waiting on this bar, placed where they fall on the way to
-     the end. The wager tick is the one part way along; nothing survives a resize because
-     they are placed in percentages. */
+     the end. Only the one part way along gets a diamond: the far one is the end of the bar.
+     The fill is two colours with a hard edge at that diamond, so the cool stretch is the road
+     to a wager and the gold stretch is the road to whatever comes next. */
   const marks = p.marks || [];
-  document.getElementById('progTicks').innerHTML = marks.map(m =>
-    '<span class="mk' + (p.have >= m.at ? ' on' : '') + '" style="left:' +
-    (p.need ? Math.min(100, m.at / p.need * 100) : 0).toFixed(3) + '%"></span>').join('');
+  const midway = marks.filter(m => m.at < p.need);
+  document.getElementById('progTicks').innerHTML = midway.map(m => {
+    const on = p.have >= m.at, key = active + ':' + m.at;
+    /* A mark that was already lit when the page opened is not news: only the crossing made
+       while somebody is watching gets the ring. */
+    const fresh = on && SEEN[key] === false;
+    if (on) SEEN[key] = true;
+    else if (SEEN[key] === undefined) SEEN[key] = false;
+    return '<span class="mk' + (on ? ' on' : '') + (fresh ? ' ping' : '') +
+      '" style="left:' + (p.need ? Math.min(100, m.at / p.need * 100) : 0).toFixed(3) +
+      '%"></span>';
+  }).join('');
+  if (midway.length && pct > 0 && p.need) {
+    const edge = Math.min(100, (midway[0].at / p.need * 100) / pct * 100);
+    bar.style.background = 'linear-gradient(90deg,var(--acc2) 0%,var(--acc) ' +
+      edge.toFixed(1) + '%,#ffe9b8 ' + edge.toFixed(1) + '%,#f0a93b 100%)';
+  } else {
+    bar.style.background = '';
+  }
   document.getElementById('progMarks').innerHTML = marks.map(m =>
     '<span' + (p.have >= m.at ? ' class=on' : '') + '>' +
     (p.have >= m.at ? '\u2713 ' : '') + money(m.at) + ' spins \u00b7 ' + m.label +
@@ -2111,7 +2142,9 @@ wheel to another.</p>
 <h4>Two marks on the bar</h4>
 <p>The <span class=p>bar</span> counts the spins you have finished on its own wheel. The first
 small mark is where a <span class=l>wager</span> opens; the end of the bar is where the next
-wheel opens. <span class=w>Wheel II</span> opens at <span class=m>50</span> finished spins on
+wheel opens. The bar turns from the wheel's own colour to <span class=m>gold</span> as it passes
+that first mark, so the cool stretch is the road to a wager and the gold one is the road to what
+comes next. A mark that has been reached stays lit. <span class=w>Wheel II</span> opens at <span class=m>50</span> finished spins on
 Wheel I and <span class=w>Wheel III</span> at <span class=m>200</span> on Wheel II. It is always
 spins, never BITS, and a spin counts only once it has been collected: close the page while the
 wheel is still turning and that spin is gone, <span class=p>uncounted</span>.</p>
@@ -2130,8 +2163,9 @@ one.</p>
 
 <section data-ow="1" hidden>
 <h4>Free spins</h4>
-<p><span class=l>2 More Spins</span> hands over two spins whatever the wager was, and each of them
-keeps the wager it was won at. They belong to this wheel and are spent here.</p>
+<p><span class=l>2 More Spins</span> grows with the wager, two at x1 and ten from x5 upwards, and
+stops at <span class=m>10</span> a spin. Each free spin keeps the wager it was won at and belongs
+to this wheel.</p>
 </section>
 
 <section data-ow="2" hidden>
@@ -2162,7 +2196,11 @@ never taken back, so stopping at two wastes nothing.</p>
 <h4>Wagering here</h4>
 <p>A spin is <span class=m>30,000 BITS</span>. A multiple opens after <span class=m>150</span>
 finished spins on this wheel, and then only for <span class=l>Silver</span> and above, up to
-<span class=m>x10</span>. Everything here is multiplied by the wager except the jackpot.</p>
+<span class=m>x10</span>. The wager multiplies the BITS and the things a slice hands over, up to
+the cap printed beside that slice: the x10 BITS Booster stops at five a spin, the x20 at three,
+and both Legacy Boosters at three, while the Legacy Tokens and the x3 and x5 BITS Boosters have
+no cap at all. The <span class=j>jackpot</span> is the one exception: a big wager fills the pot
+faster, but whoever lands on it takes the pot as it stands.</p>
 </section>
 
 <section data-ow="3" hidden>
@@ -2176,12 +2214,12 @@ each slice above, and it only limits one spin: you can hold any number of them.<
 
 <section data-ow="3" hidden>
 <h4>The Progressive Legacy Jackpot</h4>
-<p>Every paid spin here drops <span class=j>30,000 BITS</span> into one <span class=j>pot</span>
-that every player shares, whatever the wager was. Whoever lands on the
-<span class=j>jackpot</span> slice is paid the whole pot as it stands, and the pot then starts
-again from zero. The wager does not touch it: this is the one thing on the wheel that does not
-grow with a multiple. Free spins do not feed it, and a spin left before the wheel stops leaves its
-share in the pot.</p>
+<p>Every paid spin here drops its whole price into one <span class=j>pot</span> that every
+player shares: <span class=m>30,000</span> at x1, <span class=m>300,000</span> at x10. Whoever
+lands on the <span class=j>jackpot</span> slice is paid the whole pot as it stands, whatever wager
+rolled it, and the pot then starts again from zero. So a big wager feeds the pot faster without
+multiplying the payout: this is the one prize on the wheel that a wager does not enlarge. Free
+spins do not feed it, and a spin left before the wheel stops leaves its share in the pot.</p>
 </section>
 
 <section data-ow="1,2,3" hidden>
@@ -2229,7 +2267,7 @@ def index_page(user, payload, delta):
 <div class=progcard>
   <div class=proghead><span class=hint id=progLab></span><b id=progVal></b></div>
   <div class=pbar role=progressbar aria-valuemin=0 aria-valuemax=100 aria-valuenow=0>
-    <i id=progBar></i><span id=progTicks></span></div>
+    <i id=progBar></i><span id=progTicks aria-hidden=true></span></div>
   <div class=hint id=progNote style="margin-top:8px"></div>
   <div class=progmarks id=progMarks></div>
 </div>
