@@ -7,26 +7,28 @@ pasted into a web editor by hand.
 
 Three wheels
 ------------
-* Wheel I  Initiation  300 BITS, wager x1 .. x1,000,000
-* Wheel II Tempest     3,000 BITS, wager x1 .. x10
-* Wheel III Cataclysm  30,000 BITS, no wager at all
+* Wheel I  Initiation  300 BITS, wager x1 .. x1,000,000  (10 spins and Sovereign)
+* Wheel II Tempest     3,000 BITS, wager x1 .. x100       (30 spins and Administrator)
+* Wheel III Cataclysm  30,000 BITS, wager x1 .. x10       (150 spins and Silver)
 
-Wheel II opens after 100 finished spins on Wheel I. Wheel III opens after 1,000
-finished spins on Wheel II. A spin counts when it was collected; a spin left
-before the wheel stopped is a forfeit and never counts.
+Wheel II opens after 50 finished spins on Wheel I, Wheel III after 200 finished
+spins on Wheel II, and the far end of Wheel III's bar sits at 1,000. A spin counts
+when it was collected; a spin left before the wheel stopped is a forfeit.
 
 Rules this file implements
 --------------------------
 * spending BITS      = J - P * 1,000,000     (per row of the BITS Bank sheet)
 * a spin costs       = the wheel's price * wager
-* wager in multiples = Wheel I asks for Sovereign, Wheel II for Administrator.
-                       Below that the wager is forced to 1 and they simply pay
+* wager in multiples = two keys per wheel: enough finished spins on that wheel
+                       (10 / 30 / 150) and a rank (Sovereign / Administrator /
+                       Silver). Until both, the wager is forced to 1 and they pay
                        the price for whatever they win
 * BITS prizes scale  = a wager of 30 landing on 1,500 BITS owes 45,000
 * items scale too    = a wager of 10 on a fragment is ten fragments, which is
-                       three Boosters and one over. Free spins are the one
-                       exception: the count stays fixed, but each free spin keeps
-                       the wager it was won at, so the wager is already inside it
+                       three Boosters and one over. A slice may carry a cap that
+                       one spin cannot pass (fragments 20, Wheel II free spins 50,
+                       x10 BITS 5, x20 BITS 3, Legacy x3/x5 3). The cap is per
+                       spin; a player can hold any number of anything
 * fragments          = 3 of the same fragment make one Booster, automatically.
                        Fragments are kept forever; boosters are owed to the
                        player and cleared by Mark applied.
@@ -34,9 +36,10 @@ Rules this file implements
                        to. Nothing clears a bar; Mark applied only clears the deltas
                        and the prize obligations. The last bar counts Wheel III
                        spins and says nothing about what is behind it.
-* jackpot            = every paid Wheel III spin drops its whole price into one
-                       pot. The pot is paid out the moment somebody lands on the
-                       jackpot, and then starts again from zero.
+* jackpot            = every paid Wheel III spin drops the plain 30,000 into one
+                       pot, never the wager. The pot is paid out the moment
+                       somebody lands on the jackpot, and then starts again from
+                       zero.
 * reload before the spin settles = the wager is gone, the sweep keeps it
 * admin              = the Lichess account in BS_ADMIN_LICHESS (CC_Prestiged)
 
@@ -132,27 +135,32 @@ ACTIVE_SECONDS = int(env("BS_ACTIVE_SECONDS", "150"))   # a page that pinged thi
 PING_EVERY = int(env("BS_PING_SECONDS", "45"))          # how often the page says it is still there
 FREE_SPIN_AWARD = 2                    # Wheel I's "2 More Spins" hands over exactly two
 MAX_WAGER = int(env("BS_MAX_WAGER", "1000000"))         # hard ceiling on any wager
-# Who may wager, per wheel. Wheel I takes a Sovereign; Wheel II asks for Administrator,
-# because a x10 there is 30,000 BITS a spin and it is meant to be the step up.
+# A wager needs two things: enough finished spins on the wheel itself, and a rank. The ranks
+# climb the Legacy ladder top to bottom, so Silver on Wheel III sits above Administrator on
+# Wheel II. Until both are true the wager is one.
 WAGER_MIN_RANK = {1: env("BS_WAGER_MIN_RANK", "Sovereign"),
-                  2: env("BS_WAGER_MIN_RANK_II", "Administrator")}
+                  2: env("BS_WAGER_MIN_RANK_II", "Administrator"),
+                  3: env("BS_WAGER_MIN_RANK_III", "Silver")}
+WAGER_AFTER = {1: 10, 2: 30, 3: 150}         # finished spins before a multiple opens
 
-# Wheel II opens at 100 finished Wheel I spins, Wheel III at 1000 finished Wheel II spins.
-UNLOCK_SPINS = {2: 100, 3: 1000}
+# The first mark on each bar is the wager opening; the end of the bar is the next wheel.
+UNLOCK_SPINS = {2: 50, 3: 200}
 UNLOCK_FROM = {2: 1, 3: 2}
 # The far end of Wheel III's bar, counted in Wheel III spins. Whatever is behind it is not
 # written down anywhere.
-SECRET_TARGET = 10_000
+SECRET_TARGET = 1_000
 
 # --------------------------------------------------------------------------- the wheels
 # Every slice carries its chance in basis points, so 1/100 of a percent is the smallest
 # step the code can express and the weights add up to exactly 10000 every time.
 
 def _s(label, lines, emoji, code, kind, weight, color, ink="#2b2b2b", amount=0,
-       key="", scales=False, note=""):
+       key="", scales=False, note="", cap=0):
+    """One slice. `cap` is the most a single spin can hand over after the wager has been
+    multiplied in; 0 means the wager is the only limit."""
     return {"label": label, "lines": lines, "emoji": emoji, "code": code, "kind": kind,
             "weight": weight, "color": color, "ink": ink, "amount": amount, "key": key,
-            "scales": scales, "note": note}
+            "scales": scales, "note": note, "cap": int(cap)}
 
 
 # --- Wheel I: the original wheel, 16 equal slices. Green and growing.
@@ -210,15 +218,15 @@ WHEEL_2 = [
     _s("150,000 BITS", ["150,000", "BITS"], "\U0001F451", "1f451", "bits", 5, "#e2dcf7",
        amount=150000, scales=True),
     _s("5 More Spins", ["5 more", "spins"], "\U0001F504", "1f504", "free", 50, "#b6c1d6",
-       amount=5),
+       amount=5, scales=True, cap=50),
     _s("Fragment of x2 BITS Booster", ["Fragment", "of x2 BITS"], "\u26A1", "26a1", "item", 220, "#9589c2",
-       amount=1, key="frag_x2"),
+       amount=1, key="frag_x2", cap=20),
     _s("Fragment of x3 BITS Booster", ["Fragment", "of x3 BITS"], "\U0001F525", "1f525", "item", 100, "#a79ad6",
-       amount=1, key="frag_x3"),
+       amount=1, key="frag_x3", cap=20),
     _s("Fragment of x5 BITS Booster", ["Fragment", "of x5 BITS"], "\U0001F680", "1f680", "item", 60, "#b9aee6",
-       amount=1, key="frag_x5"),
+       amount=1, key="frag_x5", cap=20),
     _s("Fragment of x10 BITS Booster", ["Fragment", "of x10 BITS"], "\U0001F31F", "1f31f", "item", 20, "#cdc4f2",
-       amount=1, key="frag_x10"),
+       amount=1, key="frag_x10", cap=20),
 ]
 
 # --- Wheel III: fire, and no wagering. 18 slices.
@@ -252,13 +260,13 @@ WHEEL_3 = [
     _s("x5 BITS Booster", ["x5", "BITS"], "\U0001F525", "1f525", "item", 30, "#822338",
        ink="#ffe1d2", amount=1, key="bits_x5"),
     _s("x10 BITS Booster", ["x10", "BITS"], "\U0001F680", "1f680", "item", 20, "#9a2a44",
-       ink="#ffe1d2", amount=1, key="bits_x10"),
+       ink="#ffe1d2", amount=1, key="bits_x10", cap=5),
     _s("x20 BITS Booster", ["x20", "BITS"], "\u2604\uFE0F", "2604", "item", 10, "#b23250",
-       ink="#ffe9d6", amount=1, key="bits_x20"),
+       ink="#ffe9d6", amount=1, key="bits_x20", cap=3),
     _s("x3 Legacy Booster", ["x3", "LEGACY"], "\U0001F6E1\uFE0F", "1f6e1", "item", 60, "#3a2a4e",
-       ink="#e3d8f4", amount=1, key="legacy_x3"),
+       ink="#e3d8f4", amount=1, key="legacy_x3", cap=3),
     _s("x5 Legacy Booster", ["x5", "LEGACY"], "\U0001F52E", "1f52e", "item", 20, "#4b3764",
-       ink="#eee6fa", amount=1, key="legacy_x5"),
+       ink="#eee6fa", amount=1, key="legacy_x5", cap=3),
 ]
 
 WHEELS = {
@@ -266,14 +274,15 @@ WHEELS = {
         "wager": True, "slices": WHEEL_1,
         "tag": "Green, calm, and cheap. Every spin is 300 BITS times your wager.",
         "mood": "It grows. Nothing here is in a hurry."},
-    2: {"id": 2, "numeral": "II", "name": "Tempest", "cost": 3000, "max_wager": min(10, MAX_WAGER),
+    2: {"id": 2, "numeral": "II", "name": "Tempest", "cost": 3000,
+        "max_wager": min(100, MAX_WAGER),
         "wager": True, "slices": WHEEL_2,
-        "tag": "Wind and grey rain. 3,000 BITS a spin, wagers up to x10.",
+        "tag": "Wind and grey rain. 3,000 BITS a spin, wagers up to x100.",
         "mood": "The wind takes as much as it gives, and it takes more often."},
-    3: {"id": 3, "numeral": "III", "name": "Cataclysm", "cost": 30_000, "max_wager": 1,
-        "wager": False, "slices": WHEEL_3,
-        "tag": "Ash, ember and no wagering. 30,000 BITS a spin, and the whole price "
-               "goes into the jackpot.",
+    3: {"id": 3, "numeral": "III", "name": "Cataclysm", "cost": 30_000,
+        "max_wager": min(10, MAX_WAGER),
+        "wager": True, "slices": WHEEL_3,
+        "tag": "Ash and ember. 30,000 BITS a spin, wagers up to x10.",
         "mood": "Nothing about this wheel is steady."},
 }
 
@@ -392,7 +401,17 @@ def wager_from(wheel=1) -> str:
 
 
 def can_wager_multiple(rank_name, wheel=1) -> bool:
+    """The rank half of the gate only; `wager_open` is the one the site asks."""
     return rank_index(rank_name) >= rank_index(wager_from(wheel))
+
+
+def wager_open(db, user, wheel, counts=None) -> bool:
+    """Both halves of the gate: enough finished spins on this wheel, and the rank for it."""
+    wheel = int(wheel)
+    counts = counts if counts is not None else wheel_counts(db, user.id)
+    if int(counts.get(wheel, 0)) < int(WAGER_AFTER.get(wheel, 0)):
+        return False
+    return can_wager_multiple(user.bank_rank, wheel)
 
 
 def utcnow():
@@ -732,26 +751,35 @@ def unlocked_wheels(db, user, counts=None) -> set:
 
 
 def progress_for(db, user, wheel, counts=None, have=None):
-    """The glowing bar under the wheel: what it counts, and how far along it is.
+    """The glowing bar under the wheel: what it counts, how far along it is, and its marks.
 
     It counts every finished spin of its own wheel, all of them, forever. Two things never
     clear it: leaving a spin before it stops (that one never finishes), and Mark applied,
     which only clears the deltas and the prize obligations. A bar therefore also says
     whether the wheel it points at has opened, and that never goes back either.
+
+    `marks` are the two things waiting on the bar: the wager opening part way along, and
+    whatever sits at the end. They are drawn proportionally, so the tick sits at
+    WAGER_AFTER / need of the way across.
     """
     counts = counts if counts is not None else wheel_counts(db, user.id)
     have = have if have is not None else unlocked_wheels(db, user, counts)
     wheel = int(wheel)
     if wheel == 1:
-        return {"have": counts.get(1, 0), "need": UNLOCK_SPINS[2], "unit": "spins",
-                "target": "Wheel II", "secret": False, "open": 2 in have,
-                "opens": "Wheel II"}
-    if wheel == 2:
-        return {"have": counts.get(2, 0), "need": UNLOCK_SPINS[3], "unit": "spins",
-                "target": "Wheel III", "secret": False, "open": 3 in have,
-                "opens": "Wheel III"}
-    return {"have": counts.get(3, 0), "need": SECRET_TARGET, "unit": "spins",
-            "target": "???", "secret": True, "open": False, "opens": ""}
+        need, target, secret, opens, is_open = (UNLOCK_SPINS[2], "Wheel II", False,
+                                                "Wheel II", 2 in have)
+    elif wheel == 2:
+        need, target, secret, opens, is_open = (UNLOCK_SPINS[3], "Wheel III", False,
+                                                "Wheel III", 3 in have)
+    else:
+        need, target, secret, opens, is_open = (SECRET_TARGET, "???", True, "", False)
+    marks = [{"at": WAGER_AFTER[wheel], "kind": "wager",
+              "label": "a wager from " + WAGER_MIN_RANK[wheel]},
+             {"at": need, "kind": "secret" if secret else "wheel",
+              "label": "???" if secret else opens}]
+    return {"have": counts.get(wheel, 0), "need": need, "unit": "spins",
+            "target": target, "secret": secret, "open": is_open, "opens": opens,
+            "marks": marks}
 
 
 # --------------------------------------------------------------------------- the spin
@@ -813,11 +841,12 @@ def start_spin(db, user, wager, free=False, wheel=1):
         except (TypeError, ValueError):
             raise Refused("Pick a whole number wager.")
         if not spec["wager"]:
-            wager = 1                     # Wheel III has no wager at all
+            wager = 1
         else:
-            multiple = can_wager_multiple(user.bank_rank, wheel)
-            if not multiple:
-                wager, capped = 1, True   # below the wheel's rung: one price, no multiple
+            if not wager_open(db, user, wheel):
+                # not enough finished spins here, or the wrong rank: one price, no multiple
+                capped = int(wager) > 1
+                wager = 1
             max_wager = wheel_max_wager(wheel)
             if wager < 1 or wager > max_wager:
                 raise Refused("The wager on Wheel %s runs from 1 to %s."
@@ -839,8 +868,9 @@ def start_spin(db, user, wager, free=False, wheel=1):
     if cost:
         db.add(Ledger(user_id=user.id, spin_id=spin.id, delta=-cost, reason="spin"))
         if wheel == 3:
-            # the whole price of a Cataclysm spin drops into the shared pot
-            jackpot_add(db, cost)
+            # a Cataclysm spin drops the plain price into the shared pot, whatever the
+            # wager was: the jackpot is the one thing a wager does not touch
+            jackpot_add(db, wheel_cost(3))
     db.commit()
     return spin, cost, balance - cost
 
@@ -872,10 +902,13 @@ def reveal_spin(db, user, spin_id, now=None):
         elif slice_["kind"] in ("free", "jackpot"):
             spin.payout, spin.prize_qty = 0, 0      # settled at claim
         else:
-            # money scales with the wager; things never do
+            # money scales with the wager, and so does a thing, up to the slice's cap. The cap
+            # is per spin only: a player keeps whatever the caps let through over many spins.
             spin.payout = 0
-            spin.prize_qty = (int(slice_["amount"]) * int(spin.wager) if slice_["scales"]
-                              else int(slice_["amount"]))
+            qty = (int(slice_["amount"]) * int(spin.wager) if slice_["scales"]
+                   else int(slice_["amount"]))
+            cap = int(slice_.get("cap") or 0)
+            spin.prize_qty = min(qty, cap) if cap else qty
         spin.status = "revealed"
         db.commit()
     return spin
@@ -936,9 +969,15 @@ def _slice_landed(spin):
 
 
 def _free_award(wheel, spin):
+    """How many free spins a 'More Spins' slice hands over. Wheel II's grows with the wager
+    and stops at its cap, so a x10 and a x100 both leave with fifty."""
     slice_ = _slice_landed(spin)
     if slice_ and slice_["kind"] == "free":
-        return int(slice_["amount"])
+        count = int(slice_["amount"])
+        if slice_.get("scales"):
+            count *= max(1, int(spin.wager or 1))
+        cap = int(slice_.get("cap") or 0)
+        return min(count, cap) if cap else count
     return FREE_SPIN_AWARD
 
 
@@ -1341,6 +1380,14 @@ flex-wrap:wrap;margin-bottom:9px}
 .proghead b{font-variant-numeric:tabular-nums;letter-spacing:.02em}
 .pbar{height:15px;border-radius:999px;background:rgba(255,255,255,.07);position:relative;
 overflow:hidden;box-shadow:inset 0 1px 3px rgba(0,0,0,.55)}
+#progTicks{position:absolute;inset:0;display:block;pointer-events:none}
+.pbar .mk{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;border-radius:2px;
+background:rgba(8,12,18,.75);box-shadow:0 0 0 1px rgba(255,255,255,.28)}
+.pbar .mk.on{background:rgba(255,255,255,.9);box-shadow:0 0 8px var(--glow)}
+.progmarks{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.progmarks span{font-size:.76rem;color:var(--muted);border:1px solid var(--line);
+border-radius:999px;padding:2px 9px;white-space:nowrap}
+.progmarks span.on{color:var(--acc);border-color:var(--acc);background:rgba(255,255,255,.05)}
 .pbar>i{display:block;height:100%;border-radius:999px;width:0;
 background:linear-gradient(90deg,var(--acc2),var(--acc));
 box-shadow:0 0 10px var(--glow),0 0 26px var(--glow);transition:width .8s cubic-bezier(.2,.8,.2,1)}
@@ -1385,6 +1432,7 @@ padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.88rem}
 .oddsbox li b{font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink)}
 .oddsbox li .pct{color:var(--muted);font-variant-numeric:tabular-nums;
 font-size:.82rem}
+.oddsbox li .tag.cap{color:#ffd08a;border-color:rgba(255,208,138,.45)}
 .oddsbox li .tag{font-size:.66rem;color:var(--muted);border:1px solid var(--line);
 border-radius:999px;padding:1px 6px;margin-left:6px;white-space:nowrap}
 .oddsbox li.special b{color:var(--acc)}
@@ -1667,6 +1715,18 @@ function renderProgress() {
   const bar = document.getElementById('progBar');
   bar.style.width = pct.toFixed(2) + '%';
   bar.parentNode.setAttribute('aria-valuenow', Math.round(pct));
+
+  /* The marks are the two things waiting on this bar, placed where they fall on the way to
+     the end. The wager tick is the one part way along; nothing survives a resize because
+     they are placed in percentages. */
+  const marks = p.marks || [];
+  document.getElementById('progTicks').innerHTML = marks.map(m =>
+    '<span class="mk' + (p.have >= m.at ? ' on' : '') + '" style="left:' +
+    (p.need ? Math.min(100, m.at / p.need * 100) : 0).toFixed(3) + '%"></span>').join('');
+  document.getElementById('progMarks').innerHTML = marks.map(m =>
+    '<span' + (p.have >= m.at ? ' class=on' : '') + '>' +
+    (p.have >= m.at ? '\u2713 ' : '') + money(m.at) + ' spins \u00b7 ' + m.label +
+    '</span>').join('');
 }
 
 document.getElementById('oddsBox').addEventListener('toggle', function () {
@@ -1677,9 +1737,11 @@ function renderOdds() {
   const w = W[active];
   document.getElementById('oddsTitle').textContent = 'Chances on Wheel ' + w.numeral;
   document.getElementById('oddsList').innerHTML = w.slices.map(s => {
-    const tag = s.kind === 'free' ? '<span class=tag>that wheel</span>'
-      : s.kind === 'item' ? (s.note ? '<span class=tag>' + s.note + '</span>' : '')
-      : s.kind === 'jackpot' ? '<span class=tag>the whole pot</span>' : '';
+    let tag = s.kind === 'free' ? '<span class=tag>that wheel</span>'
+      : s.kind === 'jackpot' ? '<span class=tag>the whole pot</span>'
+      : s.note ? '<span class=tag>' + s.note + '</span>' : '';
+    if (s.cap) tag += '<span class="tag cap">cap ' + money(s.cap) + ' a spin</span>';
+    else if (s.kind === 'item') tag += '<span class=tag>no cap</span>';
     const tip = s.kind === 'jackpot'
       ? 'Every paid spin on Wheel III drops its 30,000 BITS into one pot. Whoever lands here ' +
         'takes the whole pot, and it starts again from zero.'
@@ -1701,17 +1763,16 @@ function renderHud() {
   document.getElementById('moodline').textContent = w.mood;
 
   const wagBox = document.getElementById('wagBox');
-  if (!w.wager) {
-    wagBox.innerHTML = '<div class="hint">No wager here. Every spin is ' + money(w.cost) +
-      ' BITS, and the whole price goes into the jackpot.</div>';
-  } else if (!w.multi) {
-    wagBox.innerHTML = '<div class="hint">Wheel ' + w.numeral + ' takes a wager from ' +
-      w.wagerFrom + ' and above. Below that the wager is fixed at one, so a spin is ' +
-      money(w.cost) + ' BITS.</div>';
+  if (!w.multi) {
+    wagBox.innerHTML = '<div class="hint">A multiple is not open here yet. It takes ' +
+      money(w.wagerAfter) + ' finished spins on this wheel and <b>' + w.wagerRank +
+      '</b> or above. Until both, the wager is one and a spin is ' + money(w.cost) +
+      ' BITS.</div>';
   } else {
     const steps = w.id === 1 ? [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000]
-                             : [1, 2, 3, 5, 10];
-    wagBox.innerHTML = '<div class="lab">Wager</div><div class=wagrow>' +
+                             : [1, 2, 3, 5, 10, 20, 25, 50, 100];
+    wagBox.innerHTML = '<div class="lab">Wager \u00b7 up to x' + money(w.maxWager) +
+      '</div><div class=wagrow>' +
       steps.filter(s => s <= w.maxWager).map(s =>
         '<button type=button data-w2="' + s + '"' +
         (wagered[w.id] === s ? ' class=on' : '') + '>x' + money(s) + '</button>').join('') +
@@ -1869,9 +1930,9 @@ async function spin(useFree) {
   const j = await res.json();
   if (!res.ok) { show(j.detail || 'Refused', true); return; }
   if (j.capped) {
-    show('A wager on Wheel ' + W[spinWheel].numeral + ' starts at ' +
-      W[spinWheel].wagerFrom + ', so this spin was fixed at one and cost ' +
-      money(j.cost) + ' BITS.', false);
+    show('A wager on Wheel ' + W[spinWheel].numeral + ' opens after ' +
+      money(W[spinWheel].wagerAfter) + ' finished spins and ' + W[spinWheel].wagerRank +
+      ' or above, so this spin was fixed at one and cost ' + money(j.cost) + ' BITS.', false);
   }
   spinId = j.spin_id; spinWheel = active;
   document.getElementById('balance').textContent = money(j.balance);
@@ -2047,66 +2108,87 @@ wheel to another.</p>
 </section>
 
 <section data-ow="1,2,3" hidden>
-<h4>Opening the next wheel</h4>
-<p><span class=w>Wheel I</span> is open to everybody. <span class=w>Wheel II</span> opens once
-<span class=m>100</span> spins on Wheel I have been finished, and <span class=w>Wheel III</span>
-once <span class=m>1,000</span> spins on Wheel II have been finished. Only the count matters,
-never the wager, and a spin counts only after it has been collected: close the page while the
+<h4>Two marks on the bar</h4>
+<p>The <span class=p>bar</span> counts the spins you have finished on its own wheel. The first
+small mark is where a <span class=l>wager</span> opens; the end of the bar is where the next
+wheel opens. <span class=w>Wheel II</span> opens at <span class=m>50</span> finished spins on
+Wheel I and <span class=w>Wheel III</span> at <span class=m>200</span> on Wheel II. It is always
+spins, never BITS, and a spin counts only once it has been collected: close the page while the
 wheel is still turning and that spin is gone, <span class=p>uncounted</span>.</p>
-<p>You can always step back down to a lower wheel. The <span class=p>bar</span> belongs to the
-wheel it sits under and does not move when you switch tabs.</p>
+<p>You can always step back down to a lower wheel. The bar belongs to the wheel it sits under and
+does not move when you switch tabs.</p>
 </section>
 
 <section data-ow="1" hidden>
-<h4>What the wager multiplies</h4>
-<p>The wager multiplies the <span class=m>BITS</span> a slice pays and the <span class=l>logo
-prizes</span>. Ten times the wager is ten times the figure printed on the slice.</p>
+<h4>Wagering here</h4>
+<p>A spin is <span class=m>300 BITS</span>. A multiple opens after <span class=m>10</span>
+finished spins on this wheel, and then only for <span class=l>Sovereign</span> and above. From
+there the wager runs up to <span class=m>x1,000,000</span> and multiplies the BITS a slice pays
+and the <span class=l>logo prizes</span>. Below ten spins, or below Sovereign, the wager stays at
+one.</p>
+</section>
+
+<section data-ow="1" hidden>
+<h4>Free spins</h4>
+<p><span class=l>2 More Spins</span> hands over two spins whatever the wager was, and each of them
+keeps the wager it was won at. They belong to this wheel and are spent here.</p>
 </section>
 
 <section data-ow="2" hidden>
-<h4>What the wager multiplies</h4>
-<p>The wager multiplies everything a slice hands over: the <span class=m>BITS</span>, the
-<span class=l>logo prizes</span> and the <span class=b>fragments</span>. Ten times the wager on
-a fragment slice is ten fragments.</p>
+<h4>Wagering here</h4>
+<p>A spin is <span class=m>3,000 BITS</span>. A multiple opens after <span class=m>30</span>
+finished spins on this wheel, and then only for <span class=l>Administrator</span> and above, up
+to <span class=m>x100</span>. The wager multiplies the BITS, the <span class=l>logo prizes</span>
+and the <span class=b>fragments</span>, up to the cap printed beside each slice.</p>
 </section>
 
-<section data-ow="1,2" hidden>
-<p><span class=l>Free spins</span> are the exception, and it is deliberate. The count stays
-the same at any wager, but each free spin keeps the wager it was won at and pays at that wager,
-so the wager is already inside it. A free spin also belongs to the wheel that paid it out and
-is spent there, never on another wheel.</p>
+<section data-ow="2" hidden>
+<h4>Free spins</h4>
+<p>The count grows with the wager, <span class=m>five</span> at x1 and fifty at x10, and it stops
+at <span class=m>50</span> a spin: a x10 and a x100 both leave with fifty. Each free spin keeps
+the wager it was won at and belongs to this wheel.</p>
 </section>
 
 <section data-ow="2" hidden>
 <h4>Fragments</h4>
-<p>Four slices here pay a <span class=b>fragment</span>: x2, x3, x5 and x10. Three fragments of
-the same kind quietly become one <span class=b>Booster</span> of that kind, which the admin
-hands over with the rest of what you have won. Fragments are <span class=m>yours for good</span>
-and are never taken back, so stopping at two wastes nothing.</p>
+<p>Four slices here pay a <span class=b>fragment</span>: x2, x3, x5 and x10. No single spin can
+hand over more than <span class=m>20</span> of them, whatever the wager. Three fragments of the
+same kind quietly become one <span class=b>Booster</span> of that kind, which the admin hands over
+with the rest of what you have won. Fragments are <span class=m>yours for good</span> and are
+never taken back, so stopping at two wastes nothing.</p>
 </section>
 
 <section data-ow="3" hidden>
-<h4>Boosters</h4>
-<p>This wheel skips the fragments and pays <span class=b>finished Boosters</span>: x3, x5, x10
-and <span class=m>x20</span> BITS, and x3 and x5 Legacy. The <span class=m>x20 BITS Booster</span>
-is not sold anywhere and does not come from any other wheel.</p>
+<h4>Wagering here</h4>
+<p>A spin is <span class=m>30,000 BITS</span>. A multiple opens after <span class=m>150</span>
+finished spins on this wheel, and then only for <span class=l>Silver</span> and above, up to
+<span class=m>x10</span>. Everything here is multiplied by the wager except the jackpot.</p>
+</section>
+
+<section data-ow="3" hidden>
+<h4>Boosters and tokens</h4>
+<p>This wheel skips the fragments and pays <span class=b>finished Boosters</span>. The x3 and x5
+BITS Boosters and the <span class=b>Legacy Tokens</span> have no cap at all, so a x10 hands over
+ten. The rest stop early: the <span class=m>x10</span> BITS Booster at five a spin, the
+<span class=m>x20</span> at three, and both Legacy Boosters at three. The cap is printed beside
+each slice above, and it only limits one spin: you can hold any number of them.</p>
 </section>
 
 <section data-ow="3" hidden>
 <h4>The Progressive Legacy Jackpot</h4>
-<p>Every paid spin here drops its whole price, <span class=j>30,000 BITS</span>, into one
-<span class=j>pot</span> that every player shares. It is not taken from you as a prize and not
-paid to you as a win: it goes into the pot. Whoever lands on the <span class=j>jackpot</span>
-slice is paid the whole pot, and the pot then starts again from zero. Free spins do not feed
-it. A spin left before the wheel stops keeps its <span class=j>30,000</span> in the pot.</p>
+<p>Every paid spin here drops <span class=j>30,000 BITS</span> into one <span class=j>pot</span>
+that every player shares, whatever the wager was. Whoever lands on the
+<span class=j>jackpot</span> slice is paid the whole pot as it stands, and the pot then starts
+again from zero. The wager does not touch it: this is the one thing on the wheel that does not
+grow with a multiple. Free spins do not feed it, and a spin left before the wheel stops leaves its
+share in the pot.</p>
 </section>
 
 <section data-ow="1,2,3" hidden>
 <h4>What the bar counts</h4>
-<p><span class=p>Finished spins</span>, not BITS, and all of them: the bar under Wheel I
-counts your finished Wheel I spins, from the first one onwards. Nothing ever takes those back.
-A spin you leave before the wheel stops is the one thing that does not count. The last bar
-counts Wheel III spins and nothing else.</p>
+<p><span class=p>Finished spins</span>, not BITS, and all of them: the bar counts every spin you
+finish on its wheel, from the first one onwards. Nothing ever takes those back, not a wager and
+not the admin updating the bank, so a bar never goes backwards.</p>
 </section>
 
 <section data-ow="1,2,3" hidden>
@@ -2117,7 +2199,8 @@ as a number, taken modulo <span class=m>10,000</span>, and looked up in the weig
 recompute it afterwards.</p>
 </section>
 
-</div></details>"""
+</div></details>
+"""
 
 
 def index_page(user, payload, delta):
@@ -2146,8 +2229,9 @@ def index_page(user, payload, delta):
 <div class=progcard>
   <div class=proghead><span class=hint id=progLab></span><b id=progVal></b></div>
   <div class=pbar role=progressbar aria-valuemin=0 aria-valuemax=100 aria-valuenow=0>
-    <i id=progBar></i></div>
+    <i id=progBar></i><span id=progTicks></span></div>
   <div class=hint id=progNote style="margin-top:8px"></div>
+  <div class=progmarks id=progMarks></div>
 </div>
 <div class=stage>
   <div class=card>
@@ -2509,9 +2593,10 @@ def admin_page(rows, prizes, meta):
   <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
   <div class=lab>Jackpot and testing</div>
   <p class=hint style="margin:6px 0 10px">Wheel III pot: <b>%s BITS</b>. Every paid Wheel III
-  spin adds 30,000 to it and the winner takes all of it. Resetting it hands nothing to anybody.
-  Unlocking every wheel is for your own account, so you can try Wheel II and III without
-  spinning a thousand times.</p>
+  spin adds 30,000 to it, whatever the wager was, and the winner takes all of it. Resetting it
+  hands nothing to anybody. Unlocking every wheel is for your own account, so you can try
+  Wheel II and III without grinding the spins first. It does not open their wagers: those still
+  wait for the spins and the rank.</p>
   <form method=post action="/admin/jackpot" style="display:inline"
     onsubmit="return confirm('Set the Wheel III pot back to zero?')"><button>Reset jackpot</button></form>
   %s
@@ -2798,18 +2883,20 @@ def player_payload(db, user):
             "id": w, "numeral": spec["numeral"], "name": spec["name"], "tag": spec["tag"],
             "mood": spec["mood"], "cost": spec["cost"], "maxWager": wheel_max_wager(w),
             "wager": bool(spec["wager"]), "unlocked": w in have,
-            "multi": can_wager_multiple(rank, w), "wagerFrom": wager_from(w),
+            "multi": wager_open(db, user, w, counts=counts), "wagerFrom": wager_from(w),
+            "wagerAfter": WAGER_AFTER[w], "wagerRank": WAGER_MIN_RANK[w],
             "progress": progress_for(db, user, w, counts=counts, have=have),
             "average": {"per": round(avg["per_spin"], 2), "cost": avg["cost"],
                         "pct": round(avg["pct"], 1)},
             "slices": [{"label": s["label"], "lines": s["lines"], "emoji": s["emoji"],
                         "code": s["code"], "kind": s["kind"], "amount": int(s["amount"]),
                         "color": s["color"], "ink": s["ink"], "note": s["note"],
+                        "cap": int(s.get("cap") or 0),
                         "pct": round(int(s["weight"]) / 100.0, 2)} for s in spec["slices"]],
             "free": free_state(db, user, w),
         })
     return {"wheels": wheels, "active": 1,
-            "multi": can_wager_multiple(rank, 1) or can_wager_multiple(rank, 2),
+            "multi": any(wager_open(db, user, w, counts=counts) for w in (1, 2, 3)),
             "available": state["available"], "bank": state["bank"], "delta": state["delta"],
             "display": user.display or user.lichess_id, "jackpot": jackpot_value(db),
             "ping": PING_EVERY, "reveal": REVEAL_AFTER, "ttl": SPIN_TTL,
