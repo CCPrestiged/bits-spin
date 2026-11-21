@@ -370,7 +370,7 @@ def test_each_wheel_has_its_own_price(db, wheel, cost):
     assert paid == cost and cost == main.wheel_cost(wheel)
 
 
-@pytest.mark.parametrize("wheel,max_wager", [(1, 1_000_000), (2, 100), (3, 10)])
+@pytest.mark.parametrize("wheel,max_wager", [(1, 1_000), (2, 100), (3, 10)])
 def test_the_wager_range_belongs_to_the_wheel(wheel, max_wager):
     assert main.wheel_max_wager(wheel) == max_wager
 
@@ -378,10 +378,11 @@ def test_the_wager_range_belongs_to_the_wheel(wheel, max_wager):
 def test_wheel_one_takes_the_whole_range(db):
     user = mkuser(db, "u", bits=10 ** 12)
     wager_ready(db, user, 1)
-    spin, cost, _ = main.start_spin(db, user, 1_000_000, wheel=1)
-    assert cost == 300 * 1_000_000
-    with pytest.raises(main.Refused):
-        main.start_spin(db, user, 1_000_001, wheel=1)
+    spin, cost, _ = main.start_spin(db, user, 1_000, wheel=1)
+    assert cost == 300 * 1_000
+    with pytest.raises(main.Refused) as exc:
+        main.start_spin(db, user, 1_001, wheel=1)
+    assert "1 to 1,000" in exc.value.message
 
 
 def test_wheel_two_stops_at_a_hundred(db):
@@ -1677,3 +1678,117 @@ def test_the_wheel_one_section_never_names_a_fragment(db, client):
             body = chunk
             assert "jackpot" not in body.lower()
             assert "fragment" not in body.lower()
+
+
+# ===================================================================== selling logos back
+def test_the_exchange_rates_are_the_posted_ones():
+    assert main.EXCHANGE == {"static_logo": 50, "moving_logo": 100, "custom_prefix": 150}
+    assert main.EXCHANGE_ORDER == ["static_logo", "moving_logo", "custom_prefix"]
+
+
+def test_the_exchange_lists_what_the_player_holds(db):
+    user = mkuser(db, "u")
+    main.give_award(db, user.id, "static_logo", 4)
+    main.give_award(db, user.id, "custom_prefix", 2)
+    db.commit()
+    listed = {x["key"]: x["held"] for x in main.exchange_list(db, user)}
+    assert listed == {"static_logo": 4, "moving_logo": 0, "custom_prefix": 2}
+    assert [x["rate"] for x in main.exchange_list(db, user)] == [50, 100, 150]
+
+
+def test_selling_logos_turns_them_into_bits(db):
+    user = mkuser(db, "u", bits=0)
+    main.give_award(db, user.id, "static_logo", 4)
+    db.commit()
+    bits = main.convert_assets(db, user, "static_logo", 3)
+    assert bits == 150                       # three at fifty each
+    assert main.assets_of(db, user.id)["static_logo"] == 1
+    assert main.award_totals(db, user.id)[user.id]["static_logo"] == 1
+    assert main.available_bits(db, user) == 150
+    assert main.delta_for(db, user.id, 0) == 150
+
+
+def test_selling_everything_empties_the_list(db):
+    user = mkuser(db, "u")
+    main.give_award(db, user.id, "moving_logo", 2)
+    db.commit()
+    assert main.convert_assets(db, user, "moving_logo", 2) == 200
+    assert main.assets_of(db, user.id)["moving_logo"] == 0
+    assert main.award_totals(db, user.id).get(user.id, {}) == {}
+    assert main.exchange_list(db, user)[1]["held"] == 0
+
+
+def test_the_exchange_takes_them_off_the_admin_list(db):
+    admin = mkuser(db, CC, bits=10 ** 9, admin=True)
+    user = mkuser(db, "u")
+    main.give_award(db, user.id, "custom_prefix", 1)
+    db.commit()
+    rows = [r for r in main.prize_rows(db) if r["key"] == "custom_prefix"]
+    assert rows and rows[0]["qty"] == 1
+    main.convert_assets(db, user, "custom_prefix", 1)
+    rows = [r for r in main.prize_rows(db) if r["key"] == "custom_prefix"]
+    assert rows == []                        # nothing left for the admin to hand over
+
+
+def test_the_exchange_refuses_more_than_you_have(db):
+    user = mkuser(db, "u")
+    main.give_award(db, user.id, "static_logo", 1)
+    db.commit()
+    with pytest.raises(main.Refused) as exc:
+        main.convert_assets(db, user, "static_logo", 2)
+    assert "You have 1" in exc.value.message
+    with pytest.raises(main.Refused):
+        main.convert_assets(db, user, "static_logo", 0)
+    with pytest.raises(main.Refused):
+        main.convert_assets(db, user, "bits_x2", 1)          # not a logo
+    assert main.assets_of(db, user.id)["static_logo"] == 1
+    assert main.delta_for(db, user.id, 0) == 0
+
+
+def test_nothing_can_be_sold_after_the_batch_is_applied(db, client):
+    """The logos have been handed over by then, so the site no longer holds them."""
+    admin = mkuser(db, CC, bits=10 ** 9, admin=True)
+    user = mkuser(db, "u")
+    main.give_award(db, user.id, "static_logo", 3)
+    db.commit()
+    login(client, admin.id)
+    client.post("/admin/apply")
+    db.expire_all()
+    assert main.assets_of(db, user.id)["static_logo"] == 0
+    with pytest.raises(main.Refused):
+        main.convert_assets(db, user, "static_logo", 1)
+
+
+def test_the_api_sells_logos(db, client):
+    user = mkuser(db, "u", bits=0)
+    main.give_award(db, user.id, "static_logo", 2)
+    db.commit()
+    login(client, user.id)
+    d = client.post("/api/exchange", json={"key": "static_logo", "qty": 2}).json()
+    assert d["bits"] == 100 and d["available"] == 100
+    assert {x["key"]: x["held"] for x in d["exchange"]}["static_logo"] == 0
+    bad = client.post("/api/exchange", json={"key": "static_logo", "qty": 1})
+    assert bad.status_code == 400 and "You have 0" in bad.json()["detail"]
+
+
+def test_the_page_carries_the_exchange_card(db, client):
+    user = mkuser(db, "u")
+    main.give_award(db, user.id, "static_logo", 5)
+    db.commit()
+    login(client, user.id)
+    html = client.get("/").text
+    assert "id=convCard" in html and "id=convRows" in html
+    assert "\"rate\":50" in html or "\"rate\": 50" in html
+
+
+# ===================================================================== the pot's picture
+def test_the_jackpot_slice_has_its_own_picture():
+    jackpot = [s for s in main.slices(3) if s["kind"] == "jackpot"][0]
+    assert jackpot["img"] == "/jackpot.png"
+
+
+def test_the_picture_is_served_as_a_png(client):
+    r = client.get("/jackpot.png")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/png"
+    assert len(r.content) > 4000
