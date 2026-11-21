@@ -678,7 +678,7 @@ def test_every_item_on_every_wheel_multiplies_with_the_wager():
                 assert slice_["scales"] is True, (wheel, slice_["label"])
     one_free = [s for s in main.slices(1) if s["kind"] == "free"]
     two_free = [s for s in main.slices(2) if s["kind"] == "free"]
-    assert one_free[0]["scales"] is False           # 2 More Spins stays two
+    assert one_free[0]["scales"] is True and one_free[0]["cap"] == 10
     assert two_free[0]["scales"] is True and two_free[0]["cap"] == 50
 
 
@@ -733,25 +733,29 @@ def test_tokens_are_not_capped_on_wheel_three(db):
     assert main.award_totals(db, user.id)[user.id]["legacy_token"] == 50
 
 
-def test_a_wager_does_not_feed_the_jackpot(db):
-    """The pot only ever takes the plain price, so a x10 cannot inflate it."""
+def test_a_wager_feeds_the_pot(db):
+    """A big wager fills the pot faster: the whole price of the spin goes in."""
     user = mkuser(db, "u", bits=10 ** 9, rank="Silver")
     user.test_unlocked = True
     db.commit()
     wager_ready(db, user, 3)
     main.start_spin(db, user, 10, wheel=3)
-    assert main.jackpot_value(db) == 30_000
+    assert main.jackpot_value(db) == 300_000
+    main.start_spin(db, user, 1, wheel=3)
+    assert main.jackpot_value(db) == 330_000
 
 
-def test_the_jackpot_does_not_grow_with_the_wager(db):
+def test_the_jackpot_pays_the_pot_not_a_multiple_of_it(db):
+    """The wager fills the pot, but it does not multiply the payout: a x10 takes the pot as
+    it stands."""
     user = mkuser(db, "u", bits=10 ** 9, rank="Silver")
     user.test_unlocked = True
     db.commit()
     wager_ready(db, user, 3)
     main.meta_set(db, "jackpot", "500000")
     spin = spin_at(db, user, 3, index_of(3, "Progressive Legacy Jackpot"), wager=10)[0]
-    # the pot as it stood, plus this spin's own plain 30,000: not ten times any of it
-    assert spin.payout == 500_000 + 30_000
+    # the pot as it stood, plus this spin's own 300,000, and nothing times ten
+    assert spin.payout == 500_000 + 300_000
     assert main.jackpot_value(db) == 0
 
 
@@ -830,6 +834,18 @@ def test_a_free_spin_costs_nothing_and_keeps_its_wager(db):
     out, _ = finish(db, user, spin, index=index_of(2, "600 BITS"))
     assert out.payout == 600 * 4
     assert main.available_bits(db, user) == before + 2400
+
+
+def test_wheel_one_free_spins_grow_to_ten(db):
+    """Two at x1, four at x2, and ten from x5 upwards."""
+    user = mkuser(db, "u", bits=10 ** 9)
+    wager_ready(db, user, 1)
+    spin, _, _ = spin_at(db, user, 1, index_of(1, "2 More Spins"), wager=2)
+    assert spin.prize_qty == 4
+    spin, _, _ = spin_at(db, user, 1, index_of(1, "2 More Spins"), wager=5)
+    assert spin.prize_qty == 10
+    spin, _, _ = spin_at(db, user, 1, index_of(1, "2 More Spins"), wager=1000)
+    assert spin.prize_qty == 10                     # the cap, not two thousand
 
 
 def test_a_free_spin_can_win_more_free_spins(db):
