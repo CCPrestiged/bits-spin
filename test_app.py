@@ -8,6 +8,7 @@ routes call, with a seed forced to a known slice, so "where it landed" is never 
 import io
 import os
 import tempfile
+import uuid
 
 os.environ["BS_DB_URL"] = "sqlite:///" + os.path.join(tempfile.mkdtemp(), "test.db")
 os.environ.setdefault("BS_SECRET_KEY", "test-key")
@@ -369,46 +370,76 @@ def test_each_wheel_has_its_own_price(db, wheel, cost):
     assert paid == cost and cost == main.wheel_cost(wheel)
 
 
-@pytest.mark.parametrize("wheel,max_wager", [(1, 1_000_000), (2, 10), (3, 1)])
+@pytest.mark.parametrize("wheel,max_wager", [(1, 1_000_000), (2, 100), (3, 10)])
 def test_the_wager_range_belongs_to_the_wheel(wheel, max_wager):
     assert main.wheel_max_wager(wheel) == max_wager
 
 
 def test_wheel_one_takes_the_whole_range(db):
     user = mkuser(db, "u", bits=10 ** 12)
+    wager_ready(db, user, 1)
     spin, cost, _ = main.start_spin(db, user, 1_000_000, wheel=1)
     assert cost == 300 * 1_000_000
     with pytest.raises(main.Refused):
         main.start_spin(db, user, 1_000_001, wheel=1)
 
 
-def test_wheel_two_stops_at_ten(db):
+def test_wheel_two_stops_at_a_hundred(db):
     user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
-    spin, cost, _ = main.start_spin(db, user, 10, wheel=2)
-    assert cost == 30_000
+    wager_ready(db, user, 2)
+    spin, cost, _ = main.start_spin(db, user, 100, wheel=2)
+    assert spin.wager == 100 and cost == 300_000
     with pytest.raises(main.Refused) as exc:
-        main.start_spin(db, user, 11, wheel=2)
+        main.start_spin(db, user, 101, wheel=2)
+    assert "1 to 100" in exc.value.message
+
+
+def test_wheel_three_takes_a_wager_of_ten(db):
+    user = mkuser(db, "u", bits=10 ** 9, rank="Silver")
+    user.test_unlocked = True
+    db.commit()
+    wager_ready(db, user, 3)
+    spin, cost, _ = main.start_spin(db, user, 10, wheel=3)
+    assert spin.wager == 10 and cost == 300_000
+    with pytest.raises(main.Refused) as exc:
+        main.start_spin(db, user, 11, wheel=3)
     assert "1 to 10" in exc.value.message
 
 
-def test_wheel_three_ignores_a_wager(db):
-    user = mkuser(db, "u", bits=10 ** 9)
-    user.test_unlocked = True
-    db.commit()
-    spin, cost, _ = main.start_spin(db, user, 7, wheel=3)
-    assert spin.wager == 1 and cost == 30_000
-
-
-@pytest.mark.parametrize("wheel", [1, 2])
-def test_below_sovereign_the_wager_is_forced_to_one(db, wheel):
+@pytest.mark.parametrize("wheel", [1, 2, 3])
+def test_below_the_rank_the_wager_is_forced_to_one(db, wheel):
+    """The spins are all there; the rank is not."""
     user = mkuser(db, "low", rank="Enforcer")
     user.test_unlocked = True
     db.commit()
-    spin, cost, _ = main.start_spin(db, user, 50, wheel=wheel)
+    wager_ready(db, user, wheel)
+    spin, cost, _ = main.start_spin(db, user, 5, wheel=wheel)
     assert spin.wager == 1 and spin.capped is True
     assert cost == main.wheel_cost(wheel)
+
+
+@pytest.mark.parametrize("wheel,after", [(1, 10), (2, 30), (3, 150)])
+def test_the_wager_waits_for_the_spin_count(db, wheel, after):
+    """The other half of the key: the rank is right, the finished spins are not."""
+    user = mkuser(db, "u", rank="Silver", bits=10 ** 9)
+    user.test_unlocked = True
+    db.commit()
+    grant_spins(db, user, wheel, after - 1)
+    spin, _, _ = main.start_spin(db, user, 5, wheel=wheel)
+    assert spin.wager == 1 and spin.capped is True
+    grant_spins(db, user, wheel, 1)
+    spin, cost, _ = main.start_spin(db, user, 2, wheel=wheel)
+    assert spin.wager == 2 and spin.capped is False
+    assert cost == 2 * main.wheel_cost(wheel)
+
+
+def test_asking_for_one_is_never_a_capped_spin(db):
+    """A fresh player at wager one is not told off for something they did not ask for."""
+    user = mkuser(db, "u")
+    spin, _, _ = main.start_spin(db, user, 1, wheel=1)
+    assert spin.wager == 1 and spin.capped is False
 
 
 def test_not_enough_bits_is_refused(db):
@@ -440,40 +471,49 @@ def _spin_n(db, user, wheel, n, index=0):
         finish(db, user, spin, index=index)
 
 
-def test_wheel_two_opens_on_the_hundredth_finished_spin(db):
+def grant_spins(db, user, wheel, n):
+    """Finished spins without the ceremony. Every count in the site reads rows with status
+    settled, so a row is enough to move a bar."""
+    for _ in range(n):
+        db.add(main.Spin(id=uuid.uuid4().hex, user_id=user.id, wheel=int(wheel), wager=1,
+                         cost=0, status="settled", created_at=main.utcnow(),
+                         settled_at=main.utcnow(), seed="00" * 32, commit="00" * 32,
+                         kind="bits", index_landed=0, label="", payout=0))
+    db.commit()
+
+
+def wager_ready(db, user, wheel):
+    """The spin half of the gate; the rank half comes from the account."""
+    grant_spins(db, user, wheel, main.WAGER_AFTER[int(wheel)])
+
+
+def test_wheel_two_opens_on_the_fiftieth_finished_spin(db):
     user = mkuser(db, "u", bits=10 ** 9)
-    _spin_n(db, user, 1, 99)
+    grant_spins(db, user, 1, main.UNLOCK_SPINS[2] - 1)
     assert main.unlocked_wheels(db, user) == {1}
-    _spin_n(db, user, 1, 1)
+    grant_spins(db, user, 1, 1)
     assert main.unlocked_wheels(db, user) == {1, 2}
 
 
 def test_a_forfeit_does_not_count_towards_unlocking(db):
     user = mkuser(db, "u", bits=10 ** 9)
-    _spin_n(db, user, 1, 99)
+    grant_spins(db, user, 1, main.UNLOCK_SPINS[2] - 1)
     main.start_spin(db, user, 1, wheel=1)
     spin = db.execute(select(main.Spin).where(main.Spin.user_id == user.id,
                                              main.Spin.status == "pending")).scalars().first()
     later = main.utcnow() + dt.timedelta(seconds=main.SPIN_TTL + 5)
     main.sweep(db, now=later)
-    assert main.wheel_counts(db, user.id)[1] == 99
+    assert main.wheel_counts(db, user.id)[1] == main.UNLOCK_SPINS[2] - 1
     assert 2 not in main.unlocked_wheels(db, user)
 
 
-def test_wheel_three_opens_after_a_thousand_wheel_two_spins(db):
+def test_wheel_three_opens_after_two_hundred_wheel_two_spins(db):
     user = mkuser(db, "u", bits=10 ** 12)
-    _spin_n(db, user, 1, 100)                  # Wheel II first, or nothing above it opens
-    user.test_unlocked = True
-    db.commit()
-    _spin_n(db, user, 2, 999)
-    user.test_unlocked = False
-    db.commit()
+    grant_spins(db, user, 1, main.UNLOCK_SPINS[2])      # Wheel II first
     assert main.unlocked_wheels(db, user) == {1, 2}
-    user.test_unlocked = True
-    db.commit()
-    _spin_n(db, user, 2, 1)
-    user.test_unlocked = False
-    db.commit()
+    grant_spins(db, user, 2, main.UNLOCK_SPINS[3] - 1)
+    assert main.unlocked_wheels(db, user) == {1, 2}
+    grant_spins(db, user, 2, 1)
     assert main.unlocked_wheels(db, user) == {1, 2, 3}
 
 
@@ -507,15 +547,25 @@ def test_counts_are_kept_per_wheel(db):
 
 def test_progress_bars_point_at_the_next_wheel(db):
     user = mkuser(db, "u")
-    _spin_n(db, user, 1, 36)
+    grant_spins(db, user, 1, 36)
     bar = main.progress_for(db, user, 1)
-    assert bar["have"] == 36 and bar["need"] == 100 and bar["unit"] == "spins"
+    assert bar["have"] == 36 and bar["need"] == 50 and bar["unit"] == "spins"
     assert bar["opens"] == "Wheel II" and bar["secret"] is False and bar["open"] is False
     assert main.progress_for(db, user, 2)["opens"] == "Wheel III"
-    assert main.progress_for(db, user, 2)["need"] == 1000
+    assert main.progress_for(db, user, 2)["need"] == 200
     third = main.progress_for(db, user, 3)
-    assert third["secret"] is True and third["need"] == main.SECRET_TARGET
+    assert third["secret"] is True and third["need"] == main.SECRET_TARGET == 1_000
     assert third["unit"] == "spins"
+
+
+@pytest.mark.parametrize("wheel,after,need", [(1, 10, 50), (2, 30, 200), (3, 150, 1_000)])
+def test_each_bar_carries_both_marks(wheel, after, need):
+    """Two things wait on every bar: the wager part way along, and the end of it."""
+    bar = main.progress_for(None, None, wheel, counts={wheel: 0}, have={1})
+    assert [m["at"] for m in bar["marks"]] == [after, need]
+    assert bar["marks"][0]["kind"] == "wager"
+    assert bar["marks"][0]["label"].endswith(main.WAGER_MIN_RANK[wheel])
+    assert bar["need"] == need and bar["marks"][-1]["at"] == need
 
 
 def test_the_third_bar_counts_wheel_three_spins_not_bits(db):
@@ -558,6 +608,7 @@ def test_the_bar_counts_every_finished_spin_it_ever_had(db):
 # ===================================================================== payouts
 def test_a_bits_prize_is_multiplied_by_the_wager(db):
     user = mkuser(db, "u")
+    wager_ready(db, user, 1)
     spin, cost, _ = spin_at(db, user, 1, index_of(1, "500 BITS"), wager=4)
     assert cost == 1200 and spin.payout == 2000
 
@@ -566,6 +617,7 @@ def test_a_wheel_two_prize_is_multiplied_by_the_wager(db):
     user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
+    wager_ready(db, user, 2)
     spin, cost, _ = spin_at(db, user, 2, index_of(2, "1,500 BITS"), wager=3)
     assert cost == 9000 and spin.payout == 4500
 
@@ -588,6 +640,7 @@ def test_the_bust_on_wheel_three_pays_nothing(db):
 
 def test_logos_are_multiplied_by_the_wager_on_wheel_one(db):
     user = mkuser(db, "u")
+    wager_ready(db, user, 1)
     spin, cost, _ = spin_at(db, user, 1, index_of(1, "Static Logo"), wager=30)
     assert spin.prize_qty == 30
     assert main.award_totals(db, user.id)[user.id]["static_logo"] == 30
@@ -597,6 +650,7 @@ def test_a_wager_multiplies_fragments(db):
     user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
+    wager_ready(db, user, 2)
     spin, cost, _ = spin_at(db, user, 2, index_of(2, "Fragment of x2 BITS Booster"), wager=10)
     assert spin.prize_qty == 10
     # ten fragments is three Boosters and one fragment towards the next
@@ -604,20 +658,17 @@ def test_a_wager_multiplies_fragments(db):
     assert main.fragments_of(db, user.id) == {"frag_x2": 1}
 
 
-def test_a_wager_multiplies_a_finished_booster(db):
-    """Wheel III has no wager, so the wager is forced on the row to see the rule work."""
-    user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
+def test_a_wager_multiplies_a_finished_booster_up_to_its_cap(db):
+    """x3 and x5 BITS Boosters have no cap here; the x20 stops at three a spin."""
+    user = mkuser(db, "u", bits=10 ** 9, rank="Silver")
     user.test_unlocked = True
     db.commit()
-    spin, cost, _ = main.start_spin(db, user, 1, wheel=3)
-    assert spin.wager == 1
-    spin.wager = 4                                  # as if this wheel had a wager
-    force_index(db, spin, index_of(3, "x20 BITS Booster"))
-    db.commit()
-    later = main.utcnow() + dt.timedelta(seconds=main.REVEAL_AFTER + 1)
-    assert main.reveal_spin(db, user, spin.id, now=later).prize_qty == 4
-    main.claim_spin(db, user, spin.id, now=later)
-    assert main.award_totals(db, user.id)[user.id]["bits_x20"] == 4
+    wager_ready(db, user, 3)
+    spin, _, _ = spin_at(db, user, 3, index_of(3, "x3 BITS Booster"), wager=10)
+    assert spin.prize_qty == 10                     # nothing caps this one
+    capped, _, _ = spin_at(db, user, 3, index_of(3, "x20 BITS Booster"), wager=10)
+    assert capped.prize_qty == 3
+    assert main.award_totals(db, user.id)[user.id]["bits_x20"] == 3
 
 
 def test_every_item_on_every_wheel_multiplies_with_the_wager():
@@ -625,8 +676,10 @@ def test_every_item_on_every_wheel_multiplies_with_the_wager():
         for slice_ in main.slices(wheel):
             if slice_["kind"] == "item":
                 assert slice_["scales"] is True, (wheel, slice_["label"])
-            if slice_["kind"] == "free":
-                assert slice_["scales"] is False, (wheel, slice_["label"])
+    one_free = [s for s in main.slices(1) if s["kind"] == "free"]
+    two_free = [s for s in main.slices(2) if s["kind"] == "free"]
+    assert one_free[0]["scales"] is False           # 2 More Spins stays two
+    assert two_free[0]["scales"] is True and two_free[0]["cap"] == 50
 
 
 def test_a_wager_multiplies_tokens(db):
@@ -636,16 +689,70 @@ def test_a_wager_multiplies_tokens(db):
     assert main.award_totals(db, user.id)[user.id]["legacy_token"] == 12
 
 
-def test_a_wager_never_multiplies_free_spins(db):
-    """The count is fixed on purpose: each free spin already carries the wager it was won
-    at, so multiplying the count as well would apply the wager twice."""
+def test_a_wager_multiplies_free_spins_up_to_fifty(db):
+    """Wheel II's five grow with the wager and stop at fifty a spin: a x10 and a x100 both
+    leave with the same fifty."""
     user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
+    wager_ready(db, user, 2)
     spin, cost, _ = spin_at(db, user, 2, index_of(2, "5 More Spins"), wager=10)
-    assert spin.prize_qty == 5
-    state = main.free_state(db, user, 2)
-    assert state["count"] == 5 and state["wager"] == 10
+    assert spin.prize_qty == 50 and cost == 30_000
+    assert main.free_state(db, user, 2)["count"] == 50
+    spin, _, _ = spin_at(db, user, 2, index_of(2, "5 More Spins"), wager=100)
+    assert spin.prize_qty == 50                     # the cap, not 500
+
+
+def test_a_fragment_slice_stops_at_twenty_a_spin(db):
+    user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
+    user.test_unlocked = True
+    db.commit()
+    wager_ready(db, user, 2)
+    spin, cost, _ = spin_at(db, user, 2, index_of(2, "Fragment of x2 BITS Booster"), wager=100)
+    assert cost == 300_000 and spin.prize_qty == 20
+    assert main.award_totals(db, user.id)[user.id]["bits_x2"] == 6    # twenty is six boosters
+    assert main.fragments_of(db, user.id) == {"frag_x2": 2}
+
+
+def test_the_legacy_boosters_stop_at_three_a_spin(db):
+    user = mkuser(db, "u", bits=10 ** 9, rank="Silver")
+    user.test_unlocked = True
+    db.commit()
+    wager_ready(db, user, 3)
+    spin, _, _ = spin_at(db, user, 3, index_of(3, "x5 Legacy Booster"), wager=10)
+    assert spin.prize_qty == 3
+
+
+def test_tokens_are_not_capped_on_wheel_three(db):
+    user = mkuser(db, "u", bits=10 ** 9, rank="Silver")
+    user.test_unlocked = True
+    db.commit()
+    wager_ready(db, user, 3)
+    spin, _, _ = spin_at(db, user, 3, index_of(3, "5 Legacy Tokens"), wager=10)
+    assert spin.prize_qty == 50
+    assert main.award_totals(db, user.id)[user.id]["legacy_token"] == 50
+
+
+def test_a_wager_does_not_feed_the_jackpot(db):
+    """The pot only ever takes the plain price, so a x10 cannot inflate it."""
+    user = mkuser(db, "u", bits=10 ** 9, rank="Silver")
+    user.test_unlocked = True
+    db.commit()
+    wager_ready(db, user, 3)
+    main.start_spin(db, user, 10, wheel=3)
+    assert main.jackpot_value(db) == 30_000
+
+
+def test_the_jackpot_does_not_grow_with_the_wager(db):
+    user = mkuser(db, "u", bits=10 ** 9, rank="Silver")
+    user.test_unlocked = True
+    db.commit()
+    wager_ready(db, user, 3)
+    main.meta_set(db, "jackpot", "500000")
+    spin = spin_at(db, user, 3, index_of(3, "Progressive Legacy Jackpot"), wager=10)[0]
+    # the pot as it stood, plus this spin's own plain 30,000: not ten times any of it
+    assert spin.payout == 500_000 + 30_000
+    assert main.jackpot_value(db) == 0
 
 
 def test_claiming_twice_pays_once(db):
@@ -714,6 +821,7 @@ def test_a_free_spin_costs_nothing_and_keeps_its_wager(db):
     user = mkuser(db, "u", bits=10 ** 9, rank="Administrator")
     user.test_unlocked = True
     db.commit()
+    wager_ready(db, user, 2)
     spin_at(db, user, 2, index_of(2, "5 More Spins"), wager=4)
     before = main.available_bits(db, user)
     spin, cost, balance = main.start_spin(db, user, 999, free=True, wheel=2)
@@ -1243,7 +1351,7 @@ def test_the_popup_shows_fragments_assets_and_progress(db, client):
     assert [o["key"] for o in d["owed"]] == ["legacy_x3"]
     assert [o["key"] for o in d["ever"]] == ["legacy_x3"]
     assert [w["id"] for w in d["progress"]] == [1, 2, 3]
-    assert d["progress"][0]["need"] == 100
+    assert d["progress"][0]["need"] == 50
 
 
 def test_the_popup_is_admin_only(db, client):
@@ -1287,15 +1395,20 @@ def test_api_me_returns_all_three_wheels(db, client):
     d = client.get("/api/me").json()
     assert [w["id"] for w in d["wheels"]] == [1, 2, 3]
     assert d["wheels"][0]["cost"] == 300 and d["wheels"][2]["cost"] == 30000
-    assert d["multi"] is True and d["jackpot"] == 0
+    assert d["multi"] is False and d["jackpot"] == 0      # nothing open until the spins
 
 
 def test_api_me_carries_the_gate_of_each_wheel(db, client):
-    user = mkuser(db, "u", rank="Sovereign")
+    user = mkuser(db, "u", rank="Silver")
     login(client, user.id)
     d = client.get("/api/me").json()
-    assert d["wheels"][0]["multi"] is True and d["wheels"][0]["wagerFrom"] == "Sovereign"
-    assert d["wheels"][1]["multi"] is False and d["wheels"][1]["wagerFrom"] == "Administrator"
+    assert [(w["wagerRank"], w["wagerAfter"]) for w in d["wheels"]] == [
+        ("Sovereign", 10), ("Administrator", 30), ("Silver", 150)]
+    assert [w["multi"] for w in d["wheels"]] == [False, False, False]   # no spins yet
+    wager_ready(db, user, 1)
+    d = client.get("/api/me").json()
+    assert d["wheels"][0]["multi"] is True and d["multi"] is True
+    assert d["wheels"][1]["multi"] is False
 
 
 def test_api_me_carries_the_bar_of_each_wheel(db, client):
@@ -1309,6 +1422,7 @@ def test_api_me_carries_the_bar_of_each_wheel(db, client):
 
 def test_api_spin_and_claim_walk_the_whole_way(db, client):
     user = mkuser(db, "u", bits=10_000)
+    wager_ready(db, user, 1)
     login(client, user.id)
     r = client.post("/api/spin", json={"wheel": 1, "wager": 2})
     assert r.status_code == 200
@@ -1529,7 +1643,7 @@ def test_the_explainer_keeps_later_wheels_to_themselves(db, client):
     assert 'data-ow="3"' in jackpot[:40]                 # Wheel III only
     frags = how[how.index("<h4>Fragments</h4>") - 40:]
     assert 'data-ow="2"' in frags[:40]                   # Wheel II only
-    boost = how[how.index("<h4>Boosters</h4>") - 40:]
+    boost = how[how.index("<h4>Boosters and tokens</h4>") - 40:]
     assert 'data-ow="3"' in boost[:40]                   # Wheel III only
     assert how.count("data-ow=") >= 8                    # every section is tagged
     assert "renderHow" in html                           # and the page filters on the tab
