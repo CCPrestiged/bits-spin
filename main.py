@@ -26,10 +26,14 @@ Rules this file implements
 * BITS prizes scale  = a wager of 30 landing on 1,500 BITS owes 45,000
 * items scale too    = a wager of 10 on a fragment is ten fragments, which is
                        three Boosters and one over. A slice may carry a cap that
-                       one spin cannot pass: free spins 10 on Wheel I and 50 on
-                       Wheel II, fragments 20, x10 BITS 5, x20 BITS 3, Legacy x3/x5
-                       3. The cap is per spin; a player can hold any number of
-                       anything
+                       one spin cannot pass: fragments 20, x10 BITS 5, x20 BITS 3,
+                       Legacy x3/x5 3. The cap is per spin; a player can hold any
+                       number of anything
+* free spins         = a flat number, never multiplied and never capped: two on
+                       Wheel I, twenty on Wheel II. Each one is worth the wager it
+                       was won at and belongs to the wheel that paid it, so the
+                       wager rides along inside them. Landing on it again with a
+                       free spin hands over a full new batch
 * fragments          = 3 of the same fragment make one Booster, automatically.
                        Fragments are kept forever; boosters are owed to the
                        player and cleared by Mark applied.
@@ -135,7 +139,12 @@ SPIN_TTL = int(env("BS_SPIN_TTL_SECONDS", "30"))
 REVEAL_AFTER = float(env("BS_REVEAL_SECONDS", "3.6"))
 ACTIVE_SECONDS = int(env("BS_ACTIVE_SECONDS", "150"))   # a page that pinged this recently is "open"
 PING_EVERY = int(env("BS_PING_SECONDS", "45"))          # how often the page says it is still there
-FREE_SPIN_AWARD = 2                    # Wheel I's "2 More Spins" hands over exactly two
+# How many free spins a "More Spins" slice hands over. It is a flat number: the wager is not
+# multiplied into it, because every free spin is granted at the wager the slice was won on, so
+# the wager is already inside what those spins are worth. There is no cap either; a slice pays
+# this many, every time, whatever rolled it.
+FREE_SPIN_AWARD = 2                    # Wheel I's "2 More Spins"
+FREE_SPIN_AWARD_II = 20                # Wheel II's "20 More Spins"
 MAX_WAGER = int(env("BS_MAX_WAGER", "1000000"))         # hard ceiling on any wager
 # A wager needs two things: enough finished spins on the wheel itself, and a rank. The ranks
 # climb the Legacy ladder top to bottom, so Silver on Wheel III sits above Administrator on
@@ -199,7 +208,7 @@ WHEEL_1 = [
     _s("Custom Prefix", ["Custom", "Prefix"], "\U0001F9EC", "1f9ec", "item", 625, "#b8d8f2",
        amount=1, key="custom_prefix", scales=True),
     _s("2 More Spins", ["2 more", "spins"], "\U0001F504", "1f504", "free", 625, "#a8dfe8",
-       amount=FREE_SPIN_AWARD, scales=True, cap=10),
+       amount=FREE_SPIN_AWARD),
 ]
 
 # --- Wheel II: grey and purple, the wind between the hills. 13 slices.
@@ -220,8 +229,8 @@ WHEEL_2 = [
        ink="#ffe9d6", amount=60000, scales=True),
     _s("150,000 BITS", ["150,000", "BITS"], "\U0001F451", "1f451", "bits", 5, "#e2dcf7",
        amount=150000, scales=True),
-    _s("5 More Spins", ["5 more", "spins"], "\U0001F504", "1f504", "free", 50, "#b6c1d6",
-       amount=5, scales=True, cap=50),
+    _s("20 More Spins", ["20 more", "spins"], "\U0001F504", "1f504", "free", 50, "#b6c1d6",
+       amount=FREE_SPIN_AWARD_II),
     _s("Fragment of x2 BITS Booster", ["Fragment", "of x2 BITS"], "\u26A1", "26a1", "item", 220, "#9589c2",
        amount=1, key="frag_x2", cap=20),
     _s("Fragment of x3 BITS Booster", ["Fragment", "of x3 BITS"], "\U0001F525", "1f525", "item", 100, "#a79ad6",
@@ -294,10 +303,10 @@ WHEELS = {
 # ten fragments, which is three Boosters and a fragment towards the next one. Fragments are
 # rare enough that a big wager should feel like it bought something.
 #
-# Free spins are the one exception, and it is not an oversight: the count stays fixed, but
-# every free spin keeps the wager it was won at, so the wager is already inside their value.
-# Multiplying the count as well would apply it twice, and five free spins at x10 are 98,000
-# BITS of expectation as it is.
+# Free spins are the one exception, and it is not an oversight: the count is flat, but every
+# free spin keeps the wager it was won at, so the wager is already inside their value.
+# Multiplying the count as well would apply it twice. A x10 landing on Wheel I's slice leaves
+# with two spins at x10, not twenty at x10.
 for _wheel in (WHEEL_1, WHEEL_2, WHEEL_3):
     for _slice in _wheel:
         if _slice["kind"] == "item":
@@ -616,7 +625,11 @@ def free_state_all(db, user):
     return out
 
 
-def grant_free_spins(db, user_id, wheel, wager, count=FREE_SPIN_AWARD):
+def grant_free_spins(db, user_id, wheel, wager, count=None):
+    # A grant with no count is a slice's own award, which depends on the wheel: two on Wheel I,
+    # twenty on Wheel II. Nothing here multiplies it or caps it.
+    if count is None:
+        count = FREE_SPIN_AWARD if int(wheel or 1) == 1 else FREE_SPIN_AWARD_II
     row = db.execute(select(FreeSpin)
                      .where(FreeSpin.user_id == user_id, FreeSpin.wheel == int(wheel),
                             FreeSpin.wager == wager)
@@ -1037,16 +1050,23 @@ def _slice_landed(spin):
 
 
 def _free_award(wheel, spin):
-    """How many free spins a 'More Spins' slice hands over. Wheel II's grows with the wager
-    and stops at its cap, so a x10 and a x100 both leave with fifty."""
+    """How many free spins a "More Spins" slice hands over: a flat number, whatever the wager.
+
+    Every free spin is granted at the wager the slice was won on, so the wager is already
+    inside what the player gets; multiplying the count as well would count it twice. Nothing
+    caps it either, so a x1,000 on Wheel I is still two spins (at x1,000) and a x100 on Wheel
+    II is still twenty (at x100).
+    """
     slice_ = _slice_landed(spin)
+    if not slice_:
+        # A row from before slices were numbered only kept its label; find it by that.
+        for candidate in slices(int(wheel or 1)):
+            if candidate["kind"] == "free" and candidate["label"] == spin.label:
+                slice_ = candidate
+                break
     if slice_ and slice_["kind"] == "free":
-        count = int(slice_["amount"])
-        if slice_.get("scales"):
-            count *= max(1, int(spin.wager or 1))
-        cap = int(slice_.get("cap") or 0)
-        return min(count, cap) if cap else count
-    return FREE_SPIN_AWARD
+        return int(slice_["amount"])
+    return FREE_SPIN_AWARD if int(wheel or 1) == 1 else FREE_SPIN_AWARD_II
 
 
 def _key_for_label(label):
@@ -2301,9 +2321,10 @@ one.</p>
 
 <section data-ow="1" hidden>
 <h4>Free spins</h4>
-<p><span class=l>2 More Spins</span> grows with the wager, two at x1 and ten from x5 upwards, and
-stops at <span class=m>10</span> a spin. Each free spin keeps the wager it was won at and belongs
-to this wheel.</p>
+<p><span class=l>2 More Spins</span> pays <span class=m>two</span>, whatever the wager rolled it: two
+at x1, two at x1,000. Each of those spins is worth the wager the slice was won at and belongs to
+this wheel, so a big wager rides along inside them rather than multiplying the count. There is no
+cap on how many you can hold, and landing here again with a free spin hands over another two.</p>
 </section>
 
 <section data-ow="2" hidden>
@@ -2316,9 +2337,10 @@ and the <span class=b>fragments</span>, up to the cap printed beside each slice.
 
 <section data-ow="2" hidden>
 <h4>Free spins</h4>
-<p>The count grows with the wager, <span class=m>five</span> at x1 and fifty at x10, and it stops
-at <span class=m>50</span> a spin: a x10 and a x100 both leave with fifty. Each free spin keeps
-the wager it was won at and belongs to this wheel.</p>
+<p><span class=l>20 More Spins</span> pays <span class=m>twenty</span>, whatever the wager rolled it:
+a x1 and a x100 both leave with twenty, and each of those is worth the wager it was won at. The
+wager is already inside them, so it does not multiply the count, and nothing caps how many of them
+you can hold.</p>
 </section>
 
 <section data-ow="2" hidden>
