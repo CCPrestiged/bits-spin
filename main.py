@@ -46,6 +46,10 @@ Rules this file implements
                        moment somebody lands on the jackpot and starts again from
                        zero; the wager does not multiply the payout, only the
                        feeding.
+* my stats           = every player has the card the admin opens from a row of the players
+                       table: every spin with its result, fragments, what is owed, the biggest
+                       win. Both doors call player_stats(), so they cannot disagree, and the
+                       player's door takes no uid, so it only ever answers for itself
 * reload before the spin settles = the wager is gone, the sweep keeps it
 * admin              = the Lichess account in BS_ADMIN_LICHESS (CC_Prestiged)
 
@@ -2405,7 +2409,10 @@ def index_page(user, payload, delta):
     js = (WHEEL_JS
           .replace("__DATA__", json_for_script(payload))
           .replace("__CODES__", json_for_script(EMOJI_CODES)))
-    admin_link = ('<a class=btn href="/admin">Admin</a>' if is_admin(user) else "")
+    # The stats card is for everyone, the admin link is not. Both sit on the right, the same
+    # way round on every page.
+    nav = ('<button class="btn" id=mystats type=button>My stats</button>'
+           + ('<a class=btn href="/admin">Admin</a>' if is_admin(user) else ""))
     rank = user.bank_rank or ""
     multi = payload["multi"]
     rank_pill = ('<span class="pill ok">%s \u00b7 multiples unlocked</span>' % esc(rank)
@@ -2483,12 +2490,15 @@ def index_page(user, payload, delta):
 <div class=card style="margin-top:20px"><div class=lab>Your spins</div>
   <table id=log><thead><tr><th>When</th><th>Wheel</th><th>Wager</th><th>Landed</th>
   <th>Cost</th></tr></thead><tbody></tbody></table>
-  <p class=hint style="margin-bottom:0">The last 200 spins on all three wheels.</p></div>
+  <p class=hint style="margin-bottom:0">The last 200 spins on all three wheels.
+  <b>My stats</b>, top right, has the whole card: every spin and its result, the fragments you
+  are holding, what is still owed to you, and your biggest win.</p></div>
 <footer>Real Humans \u00b7 Mystery BITS \u00b7 emoji artwork from Twemoji (CC-BY 4.0) \u00b7
   <a href="%s" target=_blank rel=noopener>BITS guide</a></footer>
-<script>%s</script>
-""" % (esc(user.display or user.lichess_id), rank_pill, admin_link, zero,
-       f"{payload['available']:,}", delta_line(delta), PIGGY, HOW, esc(BITS_HELP), js))
+<script>%s</script>%s%s
+""" % (esc(user.display or user.lichess_id), rank_pill, nav, zero,
+       f"{payload['available']:,}", delta_line(delta), PIGGY, HOW, esc(BITS_HELP), js,
+       STATS_MODAL, MY_STATS_JS))
 
 
 def login_page(message="", notice="", wheel=1):
@@ -2776,7 +2786,7 @@ def admin_page(rows, prizes, meta):
     return page("""
 <header class=top><div class=brand>Real Humans \u00b7 <b>admin</b></div>
 <div class=spacer></div><span class=pill>%s players in the bank</span>
-<span class=pill>read %s</span><a class=btn href="/">Site</a></header>
+<span class=pill>read %s</span><button class="btn" id=mystats type=button>My stats</button><a class=btn href="/">Site</a></header>
 <div class=card style="margin-bottom:18px">
   <div class=lab>Since your last update</div>
   <p class=hint>Everything you have to do is in one file: <b>Deltas + prizes</b>. Type each
@@ -2822,9 +2832,12 @@ def admin_page(rows, prizes, meta):
 <script>%s</script>
 """ % (meta["bank_players"], esc(meta["bank_synced_at"] or "never"), f"{meta['jackpot']:,}",
        unlock_btn, cleared_note, prize_head, prize_body, player_head, body, SORT_JS)
-             + PLAYER_MODAL, wheel=0)        # the admin keeps the old gold accent
+             + STATS_MODAL + ADMIN_PLAYER_JS, wheel=0)   # the admin keeps the old gold accent
 
-PLAYER_MODAL = """
+# The stats card. One modal, built by one endpoint, shown on both pages: the admin opens it
+# from a row of the players table, the player opens it from their own header. Anything the
+# admin can see about a player, the player can see about themselves.
+STATS_MODAL = """
 <style>
 .prow{cursor:pointer}
 .prow:hover td{background:rgba(255,255,255,.04)}
@@ -2835,7 +2848,7 @@ color:var(--muted);line-height:1.5}
 #pmodal{position:fixed;inset:0;z-index:60;display:none;padding:28px 16px;overflow:auto;
   background:rgba(6,8,13,.86);backdrop-filter:blur(4px)}
 #pmodal.on{display:block}
-.pm-card{max-width:1000px;margin:0 auto;background:#11151e;border:1px solid var(--line);
+.pm-card{max-width:1000px;margin:0 auto;background:var(--panel);border:1px solid var(--line);
   border-radius:18px;padding:22px}
 .pm-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px}
 .pm-name{font-family:Georgia,serif;font-size:1.35rem}
@@ -2855,7 +2868,7 @@ color:var(--muted);line-height:1.5}
   display:inline-block}
 .pips i.on{background:var(--acc);box-shadow:0 0 7px var(--glow)}
 .pm-table{max-height:46vh;overflow:auto;border-top:1px solid var(--line)}
-.pm-table th{position:sticky;top:0;background:#11151e;z-index:1}
+.pm-table th{position:sticky;top:0;background:var(--panel);z-index:1}
 .pm-bad{color:#fca5a5}
 .pm-wheels{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
 .pm-wheels div{border:1px solid var(--line);border-radius:12px;padding:8px 12px;font-size:.84rem}
@@ -2913,9 +2926,9 @@ color:var(--muted);line-height:1.5}
         '<span class=mono>' + money(p[2]) + '</span></div>';
     }).join('');
   }
-  async function open(uid){
-    var r = await fetch('/admin/player/' + uid + '.json');
-    if (!r.ok) { alert('Could not load that player.'); return; }
+  async function open(url){
+    var r = await fetch(url, {cache: 'no-store'});
+    if (!r.ok) { alert('Could not load those stats.'); return; }
     var d = await r.json(), s = d.summary;
     document.getElementById('pmName').textContent = '@' + d.display;
     document.getElementById('pmRank').textContent = d.rank || 'no rank';
@@ -2980,8 +2993,24 @@ color:var(--muted);line-height:1.5}
   document.getElementById('pmClose').addEventListener('click', function(){ pm.classList.remove('on'); });
   pm.addEventListener('click', function(e){ if (e.target === pm) pm.classList.remove('on'); });
   document.addEventListener('keydown', function(e){ if (e.key === 'Escape') pm.classList.remove('on'); });
+  window.rhStats = { open: open };
+})();
+</script>
+"""
+
+# What only the admin page does with that modal: a row opens it, the two tables keep their
+# sort, and the online dots are refreshed in place. Kept apart so the player page cannot
+# inherit a single admin route or a table that is not on it.
+ADMIN_PLAYER_JS = """
+<script>
+(function(){
+  function mine(){
+    var b = document.getElementById('mystats');
+    if (b) b.addEventListener('click', function(){ window.rhStats.open('/me/stats.json'); });
+  }
+  mine();
   document.querySelectorAll('tr.prow').forEach(function(tr){
-    tr.addEventListener('click', function(){ open(tr.dataset.uid); });
+    tr.addEventListener('click', function(){ window.rhStats.open('/admin/player/' + tr.dataset.uid + '.json'); });
   });
   makeSortable(document.getElementById('playersTbl'), 'bs_admin_sort');
   makeSortable(document.getElementById('prizeTbl'), 'bs_prize_sort');
@@ -3016,6 +3045,18 @@ color:var(--muted);line-height:1.5}
 })();
 </script>
 """
+
+# What the player page adds to that modal: one button, and its own address. It never sees
+# /admin/player/, so this page cannot be asked for somebody else's card.
+MY_STATS_JS = """
+<script>
+(function(){
+  var b = document.getElementById('mystats');
+  if (b) b.addEventListener('click', function(){ window.rhStats.open('/me/stats.json'); });
+})();
+</script>
+"""
+
 
 # --------------------------------------------------------------------------- app
 app = FastAPI(docs_url=None, redoc_url=None, title="Real Humans · Mystery BITS")
@@ -3432,13 +3473,11 @@ def admin_live(request: Request, db=Depends(get_db)):
     return {"now": now.isoformat(), "active_seconds": ACTIVE_SECONDS, "players": out}
 
 
-@app.get("/admin/player/{uid}.json")
-def admin_player_json(uid: int, request: Request, db=Depends(get_db)):
-    if not admin_guard(request, db):
-        return JSONResponse({"detail": "forbidden"}, status_code=403)
-    user = db.get(User, uid)
-    if not user:
-        return JSONResponse({"detail": "no such player"}, status_code=404)
+def player_stats(db, user) -> dict:
+    """One player's card: every spin, what was won and what is still owed, the fragments, the
+    three bars. The admin opens it for any player, a player opens it for themselves, and both
+    read this function, so the two views can never show different numbers."""
+    uid = user.id
     spins = db.execute(select(Spin).where(Spin.user_id == uid)
                        .order_by(Spin.created_at.desc()).limit(600)).scalars().all()
     total = db.execute(select(func.count(Spin.id)).where(Spin.user_id == uid)).scalar()
@@ -3499,6 +3538,27 @@ def admin_player_json(uid: int, request: Request, db=Depends(get_db)):
                    "note": x.note or "", "free": x.cost == 0, "status": x.status}
                   for x in spins],
     }
+
+
+
+@app.get("/admin/player/{uid}.json")
+def admin_player_json(uid: int, request: Request, db=Depends(get_db)):
+    if not admin_guard(request, db):
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
+    user = db.get(User, uid)
+    if not user:
+        return JSONResponse({"detail": "no such player"}, status_code=404)
+    return player_stats(db, user)
+
+
+@app.get("/me/stats.json")
+def my_stats_json(request: Request, db=Depends(get_db)):
+    """The same card, for whoever is signed in. There is no uid in the address on purpose:
+    a player can only ever ask for their own."""
+    user = current_user(request, db)
+    if not user:
+        return JSONResponse({"detail": "sign in first"}, status_code=401)
+    return player_stats(db, user)
 
 
 @app.get("/admin/deltas.csv")
